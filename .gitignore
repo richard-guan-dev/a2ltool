@@ -1,1 +1,10 @@
 /target
+*.a2l
+*.elf
+temp
+.DS_Store
+.idea
+*.zip
+*.xlsx
+*.fish
+*.py

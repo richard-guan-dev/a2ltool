@@ -49,6 +49,8 @@ pub(crate) fn insert_items(
     target_group: Option<&str>,
     log_msgs: &mut Vec<String>,
     enable_structures: bool,
+    lower_value: Option<f64>,
+    upper_value: Option<f64>,
 ) {
     let version = A2lVersion::from(&*a2l_file);
     let module = &mut a2l_file.project.module[0];
@@ -86,7 +88,15 @@ pub(crate) fn insert_items(
         {
             if is_calib {
                 match insert_characteristic_sym(
-                    module, debug_data, sym_name, &sym_info, &name_map, &sym_map, version,
+                    module,
+                    debug_data,
+                    sym_name,
+                    &sym_info,
+                    &name_map,
+                    &sym_map,
+                    version,
+                    lower_value,
+                    upper_value,
                 ) {
                     Ok(characteristic_name) => {
                         log_msgs.push(format!("Inserted CHARACTERISTIC {characteristic_name}"));
@@ -231,6 +241,8 @@ fn insert_characteristic_sym(
     name_map: &HashMap<String, ItemType>,
     sym_map: &HashMap<String, ItemType>,
     version: A2lVersion,
+    lower_value: Option<f64>,
+    upper_value: Option<f64>,
 ) -> Result<String, String> {
     let symbol_link_text = make_symbol_link_string(sym_info, debug_data);
     let item_name = make_unique_characteristic_name(module, sym_map, characteristic_sym, name_map)?;
@@ -249,7 +261,11 @@ fn insert_characteristic_sym(
 
     let datatype = get_a2l_datatype(typeinfo);
     let recordlayout_name = format!("__{datatype}_Z");
-    let (lower_limit, upper_limit) = get_type_limits(typeinfo, f64::MIN, f64::MAX);
+
+    let (default_lower_limit, default_upper_limit) = get_type_limits(typeinfo, f64::MIN, f64::MAX);
+
+    let upper_limit = upper_value.unwrap_or(default_upper_limit);
+    let lower_limit = lower_value.unwrap_or(default_lower_limit);
 
     let mut new_characteristic = Characteristic::new(
         item_name.clone(),
@@ -646,6 +662,8 @@ fn check_and_insert_simple_type(
             &isupp.name_map,
             &isupp.sym_map,
             isupp.version,
+            None,
+            None,
         ) {
             Ok(characteristic_name) => {
                 log_msgs.push(format!(
@@ -771,8 +789,8 @@ fn is_insert_requested(
     addr_ranges
         .iter()
         .any(|(lower, upper)| *lower <= address && address < *upper)
-    // alternatively insert the symbol if its name is matched by any regex
-    || name_regexes
+        // alternatively insert the symbol if its name is matched by any regex
+        || name_regexes
         .iter()
         .any(|re| re.is_match(symbol_name))
 }

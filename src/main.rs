@@ -340,6 +340,30 @@ fn core() -> Result<(), String> {
                     Vec::new()
                 };
 
+            let mut lower: Option<f64> = None;
+            if let Some(lower_values) = arg_matches.get_many::<String>("LOWER_VALUE") {
+                for value in lower_values {
+                    match value.parse::<f64>() {
+                        Ok(num) => {
+                            lower = Some(num);
+                        }
+                        Err(e) => eprintln!("Failed to parse value as f64: {}", e),
+                    }
+                }
+            }
+
+            let mut upper: Option<f64> = None;
+            if let Some(upper_values) = arg_matches.get_many::<String>("UPPER_VALUE") {
+                for value in upper_values {
+                    match value.parse::<f64>() {
+                        Ok(num) => {
+                            upper = Some(num);
+                        }
+                        Err(e) => eprintln!("Failed to parse value as f64: {}", e),
+                    }
+                }
+            }
+
             let mut log_msgs: Vec<String> = Vec::new();
             insert::insert_items(
                 &mut a2l_file,
@@ -349,6 +373,8 @@ fn core() -> Result<(), String> {
                 target_group,
                 &mut log_msgs,
                 enable_structures,
+                lower,
+                upper,
             );
             for msg in log_msgs {
                 cond_print!(verbose, now, msg);
@@ -693,6 +719,26 @@ fn get_args() -> ArgMatches {
         .number_of_values(1)
         .requires("ELFFILE")
         .value_name("VAR")
+        .action(clap::ArgAction::Append)
+    )
+    .arg(Arg::new("LOWER_VALUE")
+        .help("CHARACTERISTIC LOWER_VALUE")
+        .short('L')
+        .long("lower_value")
+        .aliases(["insert-characteristic-lower-value"])
+        .number_of_values(1)
+        .requires("ELFFILE")
+        .value_name("VAR_L")
+        .action(clap::ArgAction::Append)
+    )
+    .arg(Arg::new("UPPER_VALUE")
+        .help("CHARACTERISTIC UPPER_VALUE")
+        .short('U')
+        .long("upper_value")
+        .aliases(["insert-characteristic-upper-value"])
+        .number_of_values(1)
+        .requires("ELFFILE")
+        .value_name("VAR_U")
         .action(clap::ArgAction::Append)
     )
     .arg(Arg::new("INSERT_CHARACTERISTIC_RANGE")
