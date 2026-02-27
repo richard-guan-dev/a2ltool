@@ -1,5 +1,6 @@
-use crate::dwarf::{make_simple_unit_name, DebugData, TypeInfo};
-use crate::dwarf::{DwarfDataType, VarInfo};
+use crate::debuginfo::iter::TypeInfoIter;
+use crate::debuginfo::{DbgDataType, VarInfo};
+use crate::debuginfo::{DebugData, TypeInfo, make_simple_unit_name};
 
 #[derive(Clone)]
 pub(crate) struct SymbolInfo<'dbg> {
@@ -27,6 +28,8 @@ pub(crate) fn find_symbol<'a>(
     // The varname in a symbol link might contain additional information
     // var{Function:FuncName}{CompileUnit:UnitName_c}{Namespace:Global}"
     // This allows variables that occur in multiple files / functions / namespaces to be identified correctly
+    //
+    // Another system with a similar intention is to use "UnitName_c.varname" as the symbol name; this is handled later.
     let (plain_symbol, additional_spec) = get_additional_spec(varname);
 
     // split the a2l symbol name: e.g. "motortune.param._0_" -> ["motortune", "param", "_0_"]
@@ -52,6 +55,41 @@ pub(crate) fn find_symbol<'a>(
                         name: mangled_varname,
                         ..sym_info
                     });
+                }
+            } else if components.len() > 1 {
+                // if the symbol is not found, then it might be a global variable that is defined in a specific compile unit
+                // e.g. "UnitName_c.varname" -> "varname" in compile unit "UnitName_c"
+                // This is a non-standard extension, which is supported for compatibility with other tools.
+                //
+                // Try to use the second component of the symbol string as the symbol name, assuming that the first component is the compile unit name.
+                let additional_spec = AdditionalSpec {
+                    function_name: None,
+                    simple_unit_name: Some(components[0].to_string()),
+                    namespaces: vec![],
+                };
+                if let Ok(sym_info) = find_symbol_from_components(
+                    &components[1..],
+                    &Some(additional_spec),
+                    debug_data,
+                ) && let Some(unit_name) = make_simple_unit_name(debug_data, sym_info.unit_idx)
+                {
+                    // Explicitly check if the compile unit name matches the first component of the symbol name:
+                    // If the compile unit name is not found, then find_symbol_from_components
+                    // ignores the compile unit name and returns the first match
+                    if unit_name == components[0] {
+                        // the first component of the symbol name is the compile unit name, but we'll keep it
+                        return Ok(SymbolInfo {
+                            name: plain_symbol.to_owned(),
+                            ..sym_info
+                        });
+                    } else {
+                        // the compile unit name does not match, so this is not a valid symbol
+                        return Err(format!(
+                            "Symbol \"{}\" does not exist in compile unit \"{}\"",
+                            components.join("."),
+                            unit_name
+                        ));
+                    }
                 }
             }
 
@@ -94,7 +132,7 @@ fn find_symbol_from_components<'a>(
                     name: "".to_string(),
                     address: varinfo.address,
                     typeinfo: &TypeInfo {
-                        datatype: DwarfDataType::Uint8,
+                        datatype: DbgDataType::Uint8,
                         name: None,
                         unit_idx: usize::MAX,
                         dbginfo_offset: 0,
@@ -205,7 +243,7 @@ fn find_membertype<'a>(
         Ok((address, typeinfo))
     } else {
         match &typeinfo.datatype {
-            DwarfDataType::Class {
+            DbgDataType::Class {
                 members,
                 inheritance,
                 ..
@@ -241,7 +279,7 @@ fn find_membertype<'a>(
                     ))
                 }
             }
-            DwarfDataType::Struct { members, .. } | DwarfDataType::Union { members, .. } => {
+            DbgDataType::Struct { members, .. } | DbgDataType::Union { members, .. } => {
                 if let Some((membertype, offset)) = members.get(components[component_index]) {
                     let membertype = membertype.get_reference(&debug_data.types);
                     find_membertype(
@@ -259,7 +297,7 @@ fn find_membertype<'a>(
                     ))
                 }
             }
-            DwarfDataType::Array {
+            DbgDataType::Array {
                 dim,
                 stride,
                 arraytype,
@@ -273,13 +311,18 @@ fn find_membertype<'a>(
                         format!("could not interpret \"{arraycomponent}\" as an array index")
                     })?;
                     if indexval >= *current_dim as usize {
-                        return Err(format!("requested array index {} in expression \"{}\", but the array only has {} elements",
-                            indexval, components.join("."), current_dim));
+                        return Err(format!(
+                            "requested array index {} in expression \"{}\", but the array only has {} elements",
+                            indexval,
+                            components.join("."),
+                            current_dim
+                        ));
                     }
                     multi_index = multi_index * (*current_dim) as usize + indexval;
                 }
 
                 let elementaddr = address + (multi_index as u64 * stride);
+                let arraytype = arraytype.get_reference(&debug_data.types);
                 find_membertype(
                     arraytype,
                     debug_data,
@@ -311,13 +354,48 @@ fn get_index(idxstr: &str) -> Option<usize> {
         || (idxstr.starts_with('[') && idxstr.ends_with(']'))
     {
         let idxstrlen = idxstr.len();
-        match idxstr[1..(idxstrlen - 1)].parse() {
-            Ok(val) => Some(val),
-            Err(_) => None,
-        }
+        idxstr[1..(idxstrlen - 1)].parse().ok()
     } else {
         None
     }
+}
+
+/// find a component of a symbol based on an offset from the base address
+/// For example this could be a particular array element or struct member
+pub(crate) fn find_symbol_by_offset<'a>(
+    base_symbol: &SymbolInfo<'a>,
+    offset: i32,
+    debug_data: &'a DebugData,
+    use_new_arrays: bool,
+) -> Result<SymbolInfo<'a>, String> {
+    if offset < 0 || offset > base_symbol.typeinfo.get_size() as i32 {
+        return Err(format!(
+            "Offset {} is out of bounds for symbol \"{}\"",
+            offset, base_symbol.name
+        ));
+    }
+
+    let offset = offset as u64;
+
+    let iter = TypeInfoIter::new(&debug_data.types, base_symbol.typeinfo, use_new_arrays);
+    for (name, typeinfo, item_offset) in iter {
+        if item_offset == offset {
+            return Ok(SymbolInfo {
+                name: format!("{}{}", base_symbol.name, name),
+                address: item_offset + base_symbol.address,
+                typeinfo,
+                unit_idx: base_symbol.unit_idx,
+                function_name: base_symbol.function_name,
+                namespaces: base_symbol.namespaces,
+                is_unique: base_symbol.is_unique,
+            });
+        }
+    }
+
+    Err(format!(
+        "Could not find a symbol component at offset {offset} from \"{}\"",
+        base_symbol.name
+    ))
 }
 
 #[cfg(test)]
@@ -356,7 +434,7 @@ mod test {
         // global variable: uint32_t my_array[2]
         dbgdata.variables.insert(
             "my_array".to_string(),
-            vec![crate::dwarf::VarInfo {
+            vec![crate::debuginfo::VarInfo {
                 address: 0x1234,
                 typeref: 1,
                 unit_idx: 0,
@@ -367,9 +445,9 @@ mod test {
         dbgdata.types.insert(
             1,
             TypeInfo {
-                datatype: DwarfDataType::Array {
+                datatype: DbgDataType::Array {
                     arraytype: Box::new(TypeInfo {
-                        datatype: DwarfDataType::Uint32,
+                        datatype: DbgDataType::Uint32,
                         name: None,
                         unit_idx: usize::MAX,
                         dbginfo_offset: 0,
@@ -422,9 +500,9 @@ mod test {
             "array_item".to_string(),
             (
                 TypeInfo {
-                    datatype: DwarfDataType::Array {
+                    datatype: DbgDataType::Array {
                         arraytype: Box::new(TypeInfo {
-                            datatype: DwarfDataType::Uint32,
+                            datatype: DbgDataType::Uint32,
                             name: None,
                             unit_idx: usize::MAX,
                             dbginfo_offset: 0,
@@ -442,7 +520,7 @@ mod test {
         );
         dbgdata.variables.insert(
             "my_struct".to_string(),
-            vec![crate::dwarf::VarInfo {
+            vec![crate::debuginfo::VarInfo {
                 address: 0x00ca_fe00,
                 typeref: 2,
                 unit_idx: 0,
@@ -453,7 +531,7 @@ mod test {
         dbgdata.types.insert(
             2,
             TypeInfo {
-                datatype: DwarfDataType::Struct {
+                datatype: DbgDataType::Struct {
                     members: structmembers,
                     size: 4,
                 },
@@ -476,6 +554,89 @@ mod test {
     }
 
     #[test]
+    fn test_find_symbol_in_nested_typerefs() {
+        let mut dbgdata = DebugData {
+            types: HashMap::new(),
+            typenames: HashMap::new(),
+            variables: IndexMap::new(),
+            demangled_names: HashMap::new(),
+            unit_names: Vec::new(),
+            sections: HashMap::new(),
+        };
+
+        dbgdata.types.insert(
+            86352,
+            TypeInfo {
+                name: Some("shorttype".to_string()),
+                datatype: DbgDataType::Sint16,
+                unit_idx: 0,
+                dbginfo_offset: 86352,
+            },
+        );
+        dbgdata.types.insert(
+            86353,
+            TypeInfo {
+                name: Some("consttype".to_string()),
+                datatype: DbgDataType::TypeRef(86352, 2),
+                unit_idx: 0,
+                dbginfo_offset: 86353,
+            },
+        );
+        dbgdata.types.insert(
+            86310,
+            TypeInfo {
+                name: Some("constshortarraytype".to_string()),
+                unit_idx: 0,
+                datatype: DbgDataType::Array {
+                    size: 20,
+                    dim: vec![10],
+                    stride: 2,
+                    arraytype: Box::new(TypeInfo {
+                        name: Some("constshorttype".to_string()),
+                        unit_idx: 0,
+                        datatype: DbgDataType::TypeRef(86353, 2),
+                        dbginfo_offset: 86309,
+                    }),
+                },
+                dbginfo_offset: 86310,
+            },
+        );
+        dbgdata.variables.insert(
+            "variable".to_string(),
+            vec![crate::debuginfo::VarInfo {
+                address: 0x00ca_fe00,
+                typeref: 86310,
+                unit_idx: 0,
+                function: None,
+                namespaces: vec![],
+            }],
+        );
+
+        // try the different array indexing notations
+        let result: Result<SymbolInfo<'_>, String> = find_symbol("variable._0_", &dbgdata);
+        assert!(result.is_ok());
+        let symbolinfo = result.unwrap();
+        assert!(symbolinfo.address == 0x00ca_fe00);
+        assert!(matches!(symbolinfo.typeinfo.datatype, DbgDataType::Sint16));
+        let result: Result<SymbolInfo<'_>, String> = find_symbol("variable[0]", &dbgdata);
+        assert!(result.is_ok());
+        assert!(result.unwrap().address == 0x00ca_fe00);
+        let result: Result<SymbolInfo<'_>, String> = find_symbol("variable[1]", &dbgdata);
+        assert!(result.is_ok());
+        assert!(result.unwrap().address == 0x00ca_fe02);
+        let result: Result<SymbolInfo<'_>, String> = find_symbol("variable[9]", &dbgdata);
+        assert!(result.is_ok());
+        assert!(result.unwrap().address == 0x00ca_fe12);
+
+        // there should not be a result if the symbol name contains extra unmatched components
+        let result: Result<SymbolInfo<'_>, String> = find_symbol("variable[0].three", &dbgdata);
+        assert!(result.is_err());
+        // there should not be a result if the symbol name goes outside array boundaries
+        let result: Result<SymbolInfo<'_>, String> = find_symbol("variable[10]", &dbgdata);
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_select_varinfo() {
         let mut debug_data = DebugData {
             types: HashMap::new(),
@@ -488,7 +649,7 @@ mod test {
         debug_data.types.insert(
             0,
             TypeInfo {
-                datatype: DwarfDataType::Uint32,
+                datatype: DbgDataType::Uint32,
                 name: None,
                 unit_idx: 0,
                 dbginfo_offset: 0,
@@ -545,11 +706,64 @@ mod test {
         let (base, _add_spec) = get_additional_spec("varname");
         assert_eq!(base, "varname");
 
-        let (base, add_spec) = get_additional_spec("varname{Function:func}{Namespace:Foo}{Namespace:Bar}{CompileUnit:file_c}{Namespace:Global}");
+        let (base, add_spec) = get_additional_spec(
+            "varname{Function:func}{Namespace:Foo}{Namespace:Bar}{CompileUnit:file_c}{Namespace:Global}",
+        );
         assert_eq!(base, "varname");
         let add_spec = add_spec.unwrap();
         assert_eq!(add_spec.function_name, Some("func".to_string()));
         assert_eq!(add_spec.namespaces, vec!["Foo", "Bar"]);
         assert_eq!(add_spec.simple_unit_name, Some("file_c".to_string()));
+    }
+
+    #[test]
+    fn find_symbol_nonstandard_notation() {
+        // find a symbol using the non-standard notation "UnitName_c.varname"
+        let sym_name = "UnitName_c.varname";
+        let mut debug_data = DebugData {
+            types: HashMap::new(),
+            typenames: HashMap::new(),
+            variables: IndexMap::new(),
+            demangled_names: HashMap::new(),
+            unit_names: vec![Some("UnitName.c".to_string())],
+            sections: HashMap::new(),
+        };
+        debug_data.types.insert(
+            0,
+            TypeInfo {
+                datatype: DbgDataType::Uint32,
+                name: None,
+                unit_idx: usize::MAX,
+                dbginfo_offset: 0,
+            },
+        );
+        debug_data.variables.insert(
+            "varname".to_string(),
+            vec![VarInfo {
+                address: 0x1234,
+                typeref: 0,  // type is uint32_t
+                unit_idx: 0, // unit index for "UnitName.c"
+                function: None,
+                namespaces: vec![],
+            }],
+        );
+
+        let result = find_symbol(sym_name, &debug_data);
+        assert!(result.is_ok());
+
+        // find a nonexistent symbol - the new code path should not impact this
+        let result = find_symbol("UnitName_c.nonexistent", &debug_data);
+        assert!(result.is_err());
+
+        let result = find_symbol("bad", &debug_data);
+        assert!(result.is_err());
+
+        // find the symbol with an incorrect compile unit name
+        let result = find_symbol("WrongUnitName_c.varname", &debug_data);
+        assert!(result.is_err());
+
+        // find thge symbol without the compile unit name; this should work as well
+        let result = find_symbol("varname", &debug_data);
+        assert!(result.is_ok());
     }
 }

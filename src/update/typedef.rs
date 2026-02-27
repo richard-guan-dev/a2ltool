@@ -1,22 +1,22 @@
-use crate::dwarf::{make_simple_unit_name, DebugData, DwarfDataType, TypeInfo};
+use crate::debuginfo::{DbgDataType, DebugData, TypeInfo, make_simple_unit_name};
 use crate::update::enums::{cond_create_enum_conversion, update_enum_compu_methods};
 use crate::update::{
-    adjust_limits, get_a2l_datatype, get_fnc_values_memberid, get_inner_type, set_address_type,
-    set_bitmask, set_matrix_dim, update_characteristic_axis, update_record_layout,
-    RecordLayoutInfo, TypedefNames, TypedefReferrer, TypedefsRefInfo, UpdateInfo,
+    A2lUpdateInfo, RecordLayoutInfo, TypedefNames, TypedefReferrer, TypedefsRefInfo, adjust_limits,
+    get_a2l_datatype, get_fnc_values_memberid, get_inner_type, set_address_type, set_bitmask,
+    set_matrix_dim, update_characteristic_axis, update_record_layout,
 };
 use a2lfile::{
-    A2lObject, AddrType, CharacteristicType, FncValues, IndexMode, Module, Number, RecordLayout,
-    StructureComponent, SymbolTypeLink, TypedefBlob, TypedefCharacteristic, TypedefMeasurement,
-    TypedefStructure,
+    A2lObject, A2lObjectName, A2lObjectNameSetter, AddrType, CharacteristicType, FncValues,
+    IndexMode, ItemList, Module, Number, RecordLayout, StructureComponent, SymbolTypeLink,
+    TypedefBlob, TypedefCharacteristic, TypedefMeasurement, TypedefStructure, itemlist,
 };
-use fxhash::FxBuildHasher;
+use fnv::FnvBuildHasher;
 use indexmap::{IndexMap, IndexSet};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
-type FxIndexMap<K, V> = IndexMap<K, V, FxBuildHasher>;
+type FnvIndexMap<K, V> = IndexMap<K, V, FnvBuildHasher>;
 
 /// `TypeQuality` is used to identify how precise the information in `typedef_map` is.
 ///
@@ -30,7 +30,7 @@ enum TypeQuality {
     SymTypeLinkOnly,
 }
 
-struct TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
+struct TypedefUpdater<'dbg, 'a2l, 'rl, 'log> {
     // --- provided input ---
     /// the a2l module that is processed by the TypedefUpdater
     module: &'a2l mut Module,
@@ -40,27 +40,25 @@ struct TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
     typedef_names: TypedefNames,
     /// information about RECORD_LAYOUT items that exist in the module
     recordlayout_info: &'rl mut RecordLayoutInfo,
-    /// information about references from INSTANCEs to TYPEDEF_*
+    /// information about references from INSTANCEs to TYPEDEF_*; instance.type_ref -> Vec<(TypeInfo, referrer)>
     typedef_ref_info: TypedefsRefInfo<'dbg>,
     /// array of strings used to output log messages
     log_msgs: &'log mut Vec<String>,
-    /// name to index mapping for CompuMethods
-    compu_method_index: &'cm HashMap<String, usize>,
 
     // --- computed data ---
     /// all TYPEDEF_STRUCTURES, extracted from the module during the update for access by name
-    typedef_structs: FxIndexMap<String, TypedefStructure>,
+    typedef_structs: FnvIndexMap<String, TypedefStructure>,
     /// is_calib_struct indicates for each TYPEDEF_STRUCTURE whether it contains calibration or measurement items
     is_calib_struct: HashMap<String, bool>,
     /// mapping: debug typeinfo -> Set of TYPEDEFs using that typeinfo
     /// multiple TYPEDEFs might use the same type - e.g. the type "float32" might be used by a
     /// TYPEDEF_MEASUREMENT and a TYPEDEF_CHARACTERISTIC
-    type_map: FxIndexMap<usize, IndexSet<String>>,
+    type_map: FnvIndexMap<usize, IndexSet<String>>,
     /// mapping: TYPEDEF name to (data type, type quality)
     /// during the start of the update, some type information might be present but imprecise
-    typedef_map: FxIndexMap<String, (&'dbg TypeInfo, TypeQuality)>,
+    typedef_map: FnvIndexMap<String, (&'dbg TypeInfo, TypeQuality)>,
     /// TYPEDEF_STRUCTURES that aren't referenced, have bad type information and can't be updated
-    preserved_structs: FxIndexMap<String, TypedefStructure>,
+    preserved_structs: FnvIndexMap<String, TypedefStructure>,
     /// AXIS_PTS information. It is derived from the module and used while creating or
     /// updating TYPEDEF_CHARACTERISTICs
     axis_pts_dim: HashMap<String, u16>,
@@ -70,19 +68,20 @@ pub(crate) const FLAG_CREATE_CALIB: &str = "||calib||";
 pub(crate) const FLAG_CREATE_MEAS: &str = "||meas||";
 
 pub(crate) fn update_module_typedefs(
-    info: &mut UpdateInfo,
+    info: &A2lUpdateInfo,
+    module: &mut Module,
+    log_msgs: &mut Vec<String>,
     typedef_ref_info: TypedefsRefInfo,
     typedef_names: TypedefNames,
-    compu_method_index: &HashMap<String, usize>,
+    recordlayout_info: &mut RecordLayoutInfo,
 ) {
     let updater = TypedefUpdater::new(
-        info.module,
+        module,
         info.debug_data,
-        info.log_msgs,
+        log_msgs,
         typedef_names,
-        &mut info.reclayout_info,
+        recordlayout_info,
         typedef_ref_info,
-        compu_method_index,
     );
 
     updater.process_typedefs(info.preserve_unknown, false);
@@ -99,14 +98,13 @@ pub(crate) fn create_new_typedefs<'a>(
     let mut typedef_ref_info: TypedefsRefInfo = HashMap::new();
 
     for (typeinfo, instance_idx) in create_list {
-        let name = module.instance[*instance_idx].name.clone();
+        let name = module.instance[*instance_idx].type_ref.clone();
         typedef_ref_info
             .entry(name)
             .or_default()
             .push((Some(typeinfo), TypedefReferrer::Instance(*instance_idx)));
     }
 
-    let dummy_cm_index = HashMap::new();
     let updater = TypedefUpdater::new(
         module,
         debug_data,
@@ -114,13 +112,12 @@ pub(crate) fn create_new_typedefs<'a>(
         typedef_names,
         &mut recordlayout_info,
         typedef_ref_info,
-        &dummy_cm_index,
     );
 
     updater.process_typedefs(true, true);
 }
 
-impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
+impl<'dbg, 'a2l, 'rl, 'log> TypedefUpdater<'dbg, 'a2l, 'rl, 'log> {
     /// create a new `TypedefUpdater`
     pub(crate) fn new(
         module: &'a2l mut Module,
@@ -129,27 +126,25 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
         typedef_names: TypedefNames,
         recordlayout_info: &'rl mut RecordLayoutInfo,
         typedef_ref_info: TypedefsRefInfo<'dbg>,
-        compu_method_index: &'cm HashMap<String, usize>,
     ) -> Self {
         let axis_pts_dim: HashMap<String, u16> = module
             .axis_pts
             .iter()
-            .map(|item| (item.name.clone(), item.max_axis_points))
+            .map(|item| (item.get_name().to_string(), item.max_axis_points))
             .collect();
 
         Self {
             is_calib_struct: HashMap::with_capacity(module.typedef_structure.len()),
-            type_map: FxIndexMap::default(),
-            typedef_map: FxIndexMap::default(),
-            typedef_structs: FxIndexMap::<String, TypedefStructure>::default(),
+            type_map: FnvIndexMap::default(),
+            typedef_map: FnvIndexMap::default(),
+            typedef_structs: FnvIndexMap::<String, TypedefStructure>::default(),
             module,
             debug_data,
             log_msgs,
-            compu_method_index,
             typedef_names,
             recordlayout_info,
             typedef_ref_info,
-            preserved_structs: FxIndexMap::default(),
+            preserved_structs: FnvIndexMap::default(),
             axis_pts_dim,
         }
     }
@@ -208,7 +203,7 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
         while updated {
             updated = false;
             for td_struct in &self.module.typedef_structure {
-                if self.is_calib_struct.contains_key(&td_struct.name) {
+                if self.is_calib_struct.contains_key(td_struct.get_name()) {
                     continue;
                 }
                 let mut is_meas = false;
@@ -231,12 +226,14 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
                 if is_calib {
                     if is_meas {
                         // don't warn here, we might hit this condition several times due to the outer "while updated" loop
-                        warn_set.insert(td_struct.name.clone());
+                        warn_set.insert(td_struct.get_name().to_string());
                     }
-                    self.is_calib_struct.insert(td_struct.name.clone(), true);
+                    self.is_calib_struct
+                        .insert(td_struct.get_name().to_string(), true);
                     updated = true;
                 } else if is_meas {
-                    self.is_calib_struct.insert(td_struct.name.clone(), false);
+                    self.is_calib_struct
+                        .insert(td_struct.get_name().to_string(), false);
                     updated = true;
                 }
             }
@@ -251,7 +248,7 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
         while updated {
             updated = false;
             for td_struct in &self.module.typedef_structure {
-                if let Some(&is_calib) = self.is_calib_struct.get(&td_struct.name) {
+                if let Some(&is_calib) = self.is_calib_struct.get(td_struct.get_name()) {
                     // the current struct has a classification
                     for sc in &td_struct.structure_component {
                         if !self.typedef_names.contains(&sc.component_type) {
@@ -272,7 +269,7 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
     /// collect all valid `TYPEDEF_STRUCTURES` into `self.typedef_structs`.
     /// Invalid items are discarded or preserved in `self.preserved_structs`.
     fn build_structure_hash(&mut self) {
-        let mut structs_list = vec![];
+        let mut structs_list = itemlist![];
         std::mem::swap(&mut structs_list, &mut self.module.typedef_structure);
 
         // collect all TYPEDEF_STRUCTUREs whose SYMBOL_TYPE_LINK points to a valid type into an IndexMap
@@ -310,7 +307,7 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
                 // come from an INSTANCE
                 if let Some(instance_typeinfo) = self
                     .typedef_ref_info
-                    .get(&td_struct.name)
+                    .get(td_struct.get_name())
                     .and_then(|info_vec| {
                         info_vec
                             .iter()
@@ -328,15 +325,15 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
                     self.type_map
                         .entry(instance_typeinfo.dbginfo_offset)
                         .or_default()
-                        .insert(td_struct.name.clone());
+                        .insert(td_struct.get_name().to_string());
 
                     // in particular, there is no doubt whether this is a struct or a pointer to a struct
                     self.typedef_map.insert(
-                        td_struct.name.clone(),
+                        td_struct.get_name().to_string(),
                         (instance_typeinfo, TypeQuality::Exact),
                     );
                     self.typedef_structs
-                        .insert(td_struct.name.clone(), td_struct);
+                        .insert(td_struct.get_name().to_string(), td_struct);
                 } else if is_structure_typeinfo(typeinfo, &self.debug_data.types) {
                     // the typeinfo was derived from the symbol_type_link.
                     // this will give us inexact info, but enough to analyse the STRUCUTRE_COMPONENTs later on.
@@ -345,14 +342,14 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
                     self.type_map
                         .entry(typeinfo.dbginfo_offset)
                         .or_default()
-                        .insert(td_struct.name.clone());
+                        .insert(td_struct.get_name().to_string());
 
                     self.typedef_map.insert(
-                        td_struct.name.clone(),
+                        td_struct.get_name().to_string(),
                         (typeinfo, TypeQuality::SymTypeLinkOnly),
                     );
                     self.typedef_structs
-                        .insert(td_struct.name.clone(), td_struct);
+                        .insert(td_struct.get_name().to_string(), td_struct);
                 } else {
                     // we have typeinfo from the SYMBOL_TYPE_LINK, but the type does not represent a structure
                     // e.g. plain uint32 or similar.
@@ -360,7 +357,7 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
                 }
             } else if let Some(unnamed_typeinfo) = self
                 .typedef_ref_info
-                .get(&td_struct.name)
+                .get(td_struct.get_name())
                 .and_then(|info_vec| {
                     info_vec
                         .iter()
@@ -376,17 +373,17 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
                 self.type_map
                     .entry(unnamed_typeinfo.dbginfo_offset)
                     .or_default()
-                    .insert(td_struct.name.clone());
+                    .insert(td_struct.get_name().to_string());
 
                 self.typedef_map.insert(
-                    td_struct.name.clone(),
+                    td_struct.get_name().to_string(),
                     (unnamed_typeinfo, TypeQuality::Exact),
                 );
                 self.typedef_structs
-                    .insert(td_struct.name.clone(), td_struct);
+                    .insert(td_struct.get_name().to_string(), td_struct);
             } else {
                 self.preserved_structs
-                    .insert(td_struct.name.clone(), td_struct);
+                    .insert(td_struct.get_name().to_string(), td_struct);
             }
         }
         // collect all names of TYPEDEF_STRUCTUREs
@@ -405,7 +402,7 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
         while idx < self.typedef_structs.len() {
             let (typeinfo, quality) = self
                 .typedef_map
-                .get(&self.typedef_structs[idx].name)
+                .get(self.typedef_structs[idx].get_name())
                 .unwrap();
             // the typeinfo for the current structure is exact, so it could represent a pointer to a struct
             let typeinfo = if *quality == TypeQuality::Exact {
@@ -420,7 +417,7 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
 
             if let Some(members) = typeinfo.get_members() {
                 // normal case: typeinfo is a struct / class / union and has multiple members
-                let mut sc_old = Vec::new();
+                let mut sc_old = ItemList::new();
                 std::mem::swap(
                     &mut sc_old,
                     &mut self.typedef_structs[idx].structure_component,
@@ -429,12 +426,11 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
                     // the structure must have a member for each STRUCTURE_COMPONENT
                     if let Some(component_typeinfo) =
                         get_structure_component_typeinfo(self.debug_data, &sc, members)
+                        && (self
+                            .is_valid_structure_component(&sc.component_type, component_typeinfo)
+                            || create_only)
                     {
-                        if self.is_valid_structure_component(&sc.component_type, component_typeinfo)
-                            || create_only
-                        {
-                            self.store_structure_component(idx, sc, component_typeinfo);
-                        }
+                        self.store_structure_component(idx, sc, component_typeinfo);
                     }
                 }
             } else if let Some(component_typeinfo) = typeinfo.get_arraytype().or_else(|| {
@@ -445,13 +441,11 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
                 // rare: typeinfo is a pointer or array. In this case a TYPEDEF_STRUCTURE is used as a layer of indirection.
                 // This structure can only have a single structure component
                 self.typedef_structs[idx].structure_component.truncate(1);
-                if !self.typedef_structs[idx].structure_component.is_empty() {
-                    let sc = self.typedef_structs[idx].structure_component.remove(0);
-                    if self.is_valid_structure_component(&sc.component_type, component_typeinfo)
-                        || create_only
-                    {
-                        self.store_structure_component(idx, sc, component_typeinfo);
-                    }
+                if let Some(sc) = self.typedef_structs[idx].structure_component.pop()
+                    && (self.is_valid_structure_component(&sc.component_type, component_typeinfo)
+                        || create_only)
+                {
+                    self.store_structure_component(idx, sc, component_typeinfo);
                 }
             }
             idx += 1;
@@ -490,7 +484,7 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
                     // It gets moved back into self.typedef_structs to be updated, and all the type mappings are
                     // updated based on the component type referencing this struct
                     self.typedef_structs
-                        .insert(td_struct.name.clone(), td_struct);
+                        .insert(td_struct.get_name().to_string(), td_struct);
                     // the accounting gets updated in store_structure_component()
                     return true;
                 } else {
@@ -531,20 +525,18 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
             .push((
                 Some(component_typeinfo),
                 TypedefReferrer::StructureComponent(
-                    self.typedef_structs[struct_idx].name.clone(),
-                    sc.component_name.clone(),
+                    self.typedef_structs[struct_idx].get_name().to_string(),
+                    sc.get_name().to_string(),
                 ),
             ));
         if let Some((old_typeinfo, old_quality)) = self.typedef_map.swap_remove(&sc.component_type)
+            && !old_typeinfo.compare(component_typeinfo, &self.debug_data.types)
+            && old_quality == TypeQuality::SymTypeLinkOnly
         {
-            if !old_typeinfo.compare(component_typeinfo, &self.debug_data.types)
-                && old_quality == TypeQuality::SymTypeLinkOnly
-            {
-                self.type_map
-                    .get_mut(&old_typeinfo.dbginfo_offset)
-                    .unwrap()
-                    .swap_remove(&sc.component_type);
-            }
+            self.type_map
+                .get_mut(&old_typeinfo.dbginfo_offset)
+                .unwrap()
+                .swap_remove(&sc.component_type);
         }
         self.type_map
             .entry(component_typeinfo.dbginfo_offset)
@@ -565,7 +557,7 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
     /// Now we need to make sure that a correct target exists for each of these references.
     fn create_missing_instance_targets(&mut self) {
         let mut enum_convlist = HashMap::<String, &TypeInfo>::new();
-        let mut delete_instances = HashSet::new();
+        let mut delete_instances = vec![false; self.module.instance.len()];
         let mut refnames: Vec<_> = self.typedef_ref_info.keys().cloned().collect();
         refnames.sort();
         for refname in &refnames {
@@ -597,11 +589,11 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
             let mut dtypes = calc_distinct_types(&update_info, self.debug_data);
             // try to ensure the distinct type whose name matches the typedef name is first in the list
             for idx in 1..dtypes.len() {
-                if let Some(name) = dtypes[0].name.as_deref() {
-                    if name == refname {
-                        dtypes.swap(0, idx);
-                        break;
-                    }
+                if let Some(name) = dtypes[0].name.as_deref()
+                    && name == refname
+                {
+                    dtypes.swap(0, idx);
+                    break;
                 }
             }
 
@@ -629,23 +621,24 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
                 } else {
                     // If no TYPEDEF can be found or created for an INSTANCE, then deleting it is the best option
                     for (opt_typeinfo, referrer) in &update_info {
-                        if let TypedefReferrer::Instance(idx) = referrer {
-                            if let Some(ref_typeinfo) = opt_typeinfo {
-                                if ref_typeinfo.compare(typeinfo, &self.debug_data.types) {
-                                    delete_instances.insert(*idx);
-                                }
-                            }
+                        if let TypedefReferrer::Instance(idx) = referrer
+                            && let Some(ref_typeinfo) = opt_typeinfo
+                            && ref_typeinfo.compare(typeinfo, &self.debug_data.types)
+                        {
+                            // delay the deletion of the INSTANCE until all TYPEDEF_* have been processed
+                            // otherwise the stored indexes would be invalid
+                            delete_instances[*idx] = true;
                         }
                     }
                 }
             }
         }
 
-        let mut delete_instances_list: Vec<_> = delete_instances.iter().collect();
-        delete_instances_list.sort_by(|a, b| b.cmp(a));
-        for idx in delete_instances_list {
-            self.module.instance.remove(*idx);
-        }
+        // now delete all instances that are no longer valid
+        let mut delete_iter = delete_instances.iter();
+        self.module
+            .instance
+            .retain(|_| !*delete_iter.next().unwrap_or(&true));
 
         update_enum_compu_methods(self.module, &enum_convlist);
     }
@@ -769,13 +762,11 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
         ));
 
         // check if there is an existing record layout and only add the new one if it doesn't exist yet
-        if let Some(idx) = self.recordlayout_info.idxmap.get(&recordlayout_name) {
+        if let Some(idx) = self.module.record_layout.index(&recordlayout_name) {
             // make sure the refcount in self.recordlayout_info is correct, or else update_record_layout can fail
-            self.recordlayout_info.refcount[*idx] += 1;
+            self.recordlayout_info.refcount[idx] += 1;
         } else {
-            let idx = self.module.record_layout.len();
             self.module.record_layout.push(recordlayout);
-            self.recordlayout_info.idxmap.insert(recordlayout_name, idx);
             self.recordlayout_info.refcount.push(1);
         }
 
@@ -952,14 +943,13 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
                         self.module.instance[*instance_idx].type_ref = newname.to_string();
                     }
                     TypedefReferrer::StructureComponent(st_name, cmp_name) => {
-                        if let Some(td_struct) = self.typedef_structs.get_mut(st_name) {
-                            if let Some(component) = td_struct
+                        if let Some(td_struct) = self.typedef_structs.get_mut(st_name)
+                            && let Some(component) = td_struct
                                 .structure_component
                                 .iter_mut()
-                                .find(|cmp| cmp.component_name == *cmp_name)
-                            {
-                                component.component_type = newname.to_string();
-                            }
+                                .find(|cmp| cmp.get_name() == cmp_name)
+                        {
+                            component.component_type = newname.to_string();
                         }
                     }
                 }
@@ -976,19 +966,19 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
     ///
     /// These don't contain much info to begin with, but the size and `address_type` can (usually) be updated.
     fn update_all_typedef_blob(&mut self) {
-        let mut typedef_blob = Vec::new();
+        let mut typedef_blob = ItemList::new();
         std::mem::swap(&mut typedef_blob, &mut self.module.typedef_blob);
         for td_blob in &mut typedef_blob {
-            if let Some((blob_type, _)) = self.typedef_map.get(&td_blob.name) {
+            if let Some((blob_type, _)) = self.typedef_map.get(td_blob.get_name()) {
                 self.log_msgs
-                    .push(format!("updating TYPEDEF_BLOB \"{}\"", td_blob.name));
+                    .push(format!("updating TYPEDEF_BLOB \"{}\"", td_blob.get_name()));
 
                 td_blob.size = get_typedef_size(self.debug_data, blob_type);
                 set_address_type(&mut td_blob.address_type, blob_type);
 
                 // update all instances referring to this blob
-                if let Some(blob_info) = self.typedef_ref_info.get(&td_blob.name).cloned() {
-                    let name = td_blob.name.clone();
+                if let Some(blob_info) = self.typedef_ref_info.get(td_blob.get_name()).cloned() {
+                    let name = td_blob.get_name().to_string();
                     self.update_typedef_referrers(&blob_info, blob_type, &name);
                 }
             }
@@ -999,7 +989,7 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
     /// update all `TYPEDEF_CHARACTERISTICs`
     fn update_all_typedef_characteristic(&mut self) {
         let mut enum_convlist = HashMap::<String, &TypeInfo>::new();
-        let mut typedef_characteristic = Vec::new();
+        let mut typedef_characteristic = ItemList::new();
         // borrow checker workaround: extract the list of typedef_characteristic from the module, so
         // that we can have mutable references to items without locking up self as well
         std::mem::swap(
@@ -1008,15 +998,15 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
         );
 
         for td_char in &mut typedef_characteristic {
-            if let Some((char_type, _)) = self.typedef_map.get(&td_char.name).cloned() {
+            if let Some((char_type, _)) = self.typedef_map.get(td_char.get_name()).cloned() {
                 self.log_msgs.push(format!(
                     "updating TYPEDEF_CHARACTERISTIC \"{}\"",
-                    td_char.name
+                    td_char.get_name()
                 ));
                 self.update_typedef_characteristic(td_char, char_type, &mut enum_convlist);
                 // update all instances referring to this characteristic
-                if let Some(char_info) = self.typedef_ref_info.get(&td_char.name).cloned() {
-                    self.update_typedef_referrers(&char_info, char_type, &td_char.name);
+                if let Some(char_info) = self.typedef_ref_info.get(td_char.get_name()).cloned() {
+                    self.update_typedef_referrers(&char_info, char_type, td_char.get_name());
                 }
             }
         }
@@ -1039,15 +1029,14 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
         // which of the struct members contains the data. Other members would typically represent AXIS information.
         // the inner_typeinfo we're looking for here is the typeinfo of the data struct member.
         // If this is not a struct, then inner_typeinfo == char_type
-        let member_id =
-            get_fnc_values_memberid(self.module, self.recordlayout_info, &td_char.record_layout);
+        let member_id = get_fnc_values_memberid(self.module, &td_char.record_layout);
         if let Some(inner_typeinfo) = get_inner_type(char_type, member_id) {
-            if let DwarfDataType::Enum { enumerators, .. } = &inner_typeinfo.datatype {
+            if let DbgDataType::Enum { enumerators, .. } = &inner_typeinfo.datatype {
                 // the values of this struct are of type enum
                 let enum_name = inner_typeinfo
                     .name
                     .clone()
-                    .unwrap_or_else(|| format!("{}_compu_method", td_char.name));
+                    .unwrap_or_else(|| format!("{}_compu_method", td_char.get_name()));
                 if td_char.conversion == "NO_COMPU_METHOD" {
                     td_char.conversion = enum_name;
                 }
@@ -1056,10 +1045,7 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
             }
             set_bitmask(&mut td_char.bit_mask, inner_typeinfo);
 
-            let opt_compu_method = self
-                .compu_method_index
-                .get(&td_char.conversion)
-                .and_then(|idx| self.module.compu_method.get(*idx));
+            let opt_compu_method = self.module.compu_method.get(&td_char.conversion);
             let (ll, ul) = adjust_limits(
                 inner_typeinfo,
                 td_char.lower_limit,
@@ -1075,7 +1061,7 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
         if td_char.characteristic_type == CharacteristicType::Ascii {
             // a string is an array of characters. We only require the array, because a
             // character type can be different things in different situations or languages: e.g. char / wchar_t
-            if let DwarfDataType::Array { dim, .. } = &char_type.datatype {
+            if let DbgDataType::Array { dim, .. } = &char_type.datatype {
                 if dim.len() == 1 {
                     let number = td_char.number.get_or_insert(Number::new(0));
                     td_char.matrix_dim = None;
@@ -1108,8 +1094,8 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
         }
 
         let record_layout =
-            if let Some(idx) = self.recordlayout_info.idxmap.get(&td_char.record_layout) {
-                Some(&self.module.record_layout[*idx])
+            if let Some(idx) = self.module.record_layout.index(&td_char.record_layout) {
+                Some(&self.module.record_layout[idx])
             } else {
                 None
             };
@@ -1130,21 +1116,23 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
     /// update all `TYPEDEF_MEASUREMENTs`
     fn update_all_typedef_measurement(&mut self) {
         let mut enum_convlist = HashMap::<String, &TypeInfo>::new();
-        let mut typedef_measurement = Vec::new();
+        let mut typedef_measurement = ItemList::new();
         std::mem::swap(
             &mut typedef_measurement,
             &mut self.module.typedef_measurement,
         );
 
         for td_meas in &mut typedef_measurement {
-            if let Some((meas_type, _)) = self.typedef_map.get(&td_meas.name).cloned() {
-                self.log_msgs
-                    .push(format!("updating TYPEDEF_MEASUREMENT \"{}\"", td_meas.name));
+            if let Some((meas_type, _)) = self.typedef_map.get(td_meas.get_name()).cloned() {
+                self.log_msgs.push(format!(
+                    "updating TYPEDEF_MEASUREMENT \"{}\"",
+                    td_meas.get_name()
+                ));
 
                 self.update_typedef_measurement(td_meas, meas_type, &mut enum_convlist);
                 // update all instances referring to this characteristic
-                if let Some(meas_info) = self.typedef_ref_info.get(&td_meas.name).cloned() {
-                    self.update_typedef_referrers(&meas_info, meas_type, &td_meas.name);
+                if let Some(meas_info) = self.typedef_ref_info.get(td_meas.get_name()).cloned() {
+                    self.update_typedef_referrers(&meas_info, meas_type, td_meas.get_name());
                 }
             }
         }
@@ -1165,21 +1153,18 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
     ) {
         td_meas.datatype = get_a2l_datatype(meas_type);
         set_bitmask(&mut td_meas.bit_mask, meas_type);
-        if let DwarfDataType::Enum { enumerators, .. } = &meas_type.datatype {
+        if let DbgDataType::Enum { enumerators, .. } = &meas_type.datatype {
             if td_meas.conversion == "NO_COMPU_METHOD" {
                 td_meas.conversion = meas_type
                     .name
                     .clone()
-                    .unwrap_or_else(|| format!("{}_compu_method", td_meas.name));
+                    .unwrap_or_else(|| format!("{}_compu_method", td_meas.get_name()));
             }
             cond_create_enum_conversion(self.module, &td_meas.conversion, enumerators);
             enum_convlist.insert(td_meas.conversion.clone(), meas_type);
         }
 
-        let opt_compu_method = self
-            .compu_method_index
-            .get(&td_meas.conversion)
-            .and_then(|idx| self.module.compu_method.get(*idx));
+        let opt_compu_method = self.module.compu_method.get(&td_meas.conversion);
         let (ll, ul) = adjust_limits(
             meas_type,
             td_meas.lower_limit,
@@ -1195,18 +1180,21 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
     /// update all `TYPEDEF_STRUCTUREs`
     fn update_all_typedef_structure(&mut self) {
         let mut enum_convlist = HashMap::<String, &TypeInfo>::new();
-        let mut typedef_structs = FxIndexMap::default();
+        let mut typedef_structs = FnvIndexMap::default();
         std::mem::swap(&mut typedef_structs, &mut self.typedef_structs);
 
         for (_, td_struct) in &mut typedef_structs {
-            if let Some((struct_type, _)) = self.typedef_map.get(&td_struct.name).cloned() {
-                self.log_msgs
-                    .push(format!("updating TYPEDEF_STRUCTURE \"{}\"", td_struct.name));
+            if let Some((struct_type, _)) = self.typedef_map.get(td_struct.get_name()).cloned() {
+                self.log_msgs.push(format!(
+                    "updating TYPEDEF_STRUCTURE \"{}\"",
+                    td_struct.get_name()
+                ));
 
                 self.update_typedef_structure(td_struct, struct_type, &mut enum_convlist);
                 // update all instances referring to this structure
-                if let Some(struct_info) = self.typedef_ref_info.get(&td_struct.name).cloned() {
-                    self.update_typedef_referrers(&struct_info, struct_type, &td_struct.name);
+                if let Some(struct_info) = self.typedef_ref_info.get(td_struct.get_name()).cloned()
+                {
+                    self.update_typedef_referrers(&struct_info, struct_type, td_struct.get_name());
                 }
             }
         }
@@ -1214,7 +1202,7 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
         // updating the structs may have caused new structs to be created.
         // These will have been added to the empty self.typedef_structs
         // Build a new IndexMap of old + new
-        let mut typedef_structs2 = FxIndexMap::default();
+        let mut typedef_structs2 = FnvIndexMap::default();
         std::mem::swap(&mut typedef_structs2, &mut self.typedef_structs);
         typedef_structs.extend(typedef_structs2);
         self.typedef_structs = typedef_structs;
@@ -1231,7 +1219,10 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
         typeinfo: &'dbg TypeInfo,
         enum_convlist: &mut HashMap<String, &'dbg TypeInfo>,
     ) {
-        let is_calib = *self.is_calib_struct.get(&td_struct.name).unwrap_or(&false);
+        let is_calib = *self
+            .is_calib_struct
+            .get(td_struct.get_name())
+            .unwrap_or(&false);
 
         td_struct.total_size = get_typedef_size(self.debug_data, typeinfo);
         self.update_symbol_type_link(td_struct, typeinfo);
@@ -1243,13 +1234,13 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
             .map_or(typeinfo, |(_, t)| t);
 
         match &typeinfo.datatype {
-            DwarfDataType::Struct { members, .. }
-            | DwarfDataType::Union { members, .. }
-            | DwarfDataType::Class { members, .. } => {
+            DbgDataType::Struct { members, .. }
+            | DbgDataType::Union { members, .. }
+            | DbgDataType::Class { members, .. } => {
                 // typical case: the data type of the typedef struct is "structlike" and has a list of members
                 self.update_typedef_struct_content(td_struct, members, enum_convlist, is_calib);
             }
-            DwarfDataType::Array { .. } => {
+            DbgDataType::Array { .. } => {
                 // This type is not a struct, it is actually an array.
                 // In this case, there is only one STRUCTURE_COMPONENT which represents the array element type
                 // The structure component has an offset of 0 and a MATRIX_DIM to represent the array correctly
@@ -1264,9 +1255,11 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
                     layout.start_offset = 1; // only one newline before this block -- i.e. no empty lines
                     layout.item_location.2 = (1, false); // offset is placed on a new line, not displayd as hex
                 }
+                td_struct
+                    .structure_component
+                    .rename_item(0, "array_element");
                 let sc = &mut td_struct.structure_component[0];
                 sc.address_offset = 0;
-                sc.component_name = "array_element".to_string();
                 sc.symbol_type_link = None;
                 set_matrix_dim(&mut sc.matrix_dim, typeinfo, true);
 
@@ -1278,7 +1271,7 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
                     td_struct.structure_component.truncate(0);
                 }
             }
-            DwarfDataType::Pointer(_, _) => {
+            DbgDataType::Pointer(_, _) => {
                 // insanity! - the original declaration would have to be something like "sometype*** var".
                 // In that situation, the INSTANCE would consume the first layer of indirection and set ADDRESS_TYPE,
                 // then this TYPEDEF_STRUCTURE gets the second layer and also sets ADDRESS_TYPE, and finally we get here.
@@ -1293,9 +1286,9 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
                     layout.start_offset = 1; // only one newline before this block -- i.e. no empty lines
                     layout.item_location.2 = (1, false); // offset is placed on a new line, not displayd as hex
                 }
+                td_struct.structure_component.rename_item(0, "ptr");
                 let sc = &mut td_struct.structure_component[0];
                 sc.address_offset = 0;
-                sc.component_name = "ptr".to_string();
                 set_address_type(&mut sc.address_type, typeinfo);
                 if let Some((_, pt_type)) = typeinfo.get_pointer(&self.debug_data.types) {
                     // it might even be a pointer to an array!
@@ -1328,17 +1321,14 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
         enum_convlist: &mut HashMap<String, &'dbg TypeInfo>,
         is_calib: bool,
     ) {
-        let mut structure_components = Vec::new();
+        let mut structure_components = ItemList::new();
         std::mem::swap(
             &mut structure_components,
             &mut td_struct.structure_component,
         );
         for (cur_member_name, (typeinfo_ref, cur_member_offset)) in members {
             let cur_type = typeinfo_ref.get_reference(&self.debug_data.types);
-            let mut sc = if let Some(sc) = structure_components
-                .iter()
-                .find(|sc| &sc.component_name == cur_member_name)
-            {
+            let mut sc = if let Some(sc) = structure_components.get(cur_member_name) {
                 sc.clone()
             } else {
                 let mut sc = StructureComponent::new(String::new(), String::new(), 0);
@@ -1360,10 +1350,10 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
             {
                 // only create a STRUCTURE_COMPONENT for items whose inner datatype is not FuncPtr
                 // Other is used for void pointers, which is only allowed for calibration as a TYPEDEF_BLOB
-                if !matches!(&final_typeinfo.datatype, DwarfDataType::FuncPtr(_))
-                    && (is_calib || !matches!(&final_typeinfo.datatype, DwarfDataType::Other(_)))
+                if !matches!(&final_typeinfo.datatype, DbgDataType::FuncPtr(_))
+                    && (is_calib || !matches!(&final_typeinfo.datatype, DbgDataType::Other(_)))
                 {
-                    sc.component_name = cur_member_name.clone();
+                    sc.set_name(cur_member_name.clone());
                     // set ADDRESS_TYPE if cur_member_typeinfo is a pointer, or delete it
                     set_address_type(&mut sc.address_type, cur_type);
                     // update, set or delete MATRIX_DIM
@@ -1387,8 +1377,8 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
                             .push((
                                 Some(cur_type_unwrapped),
                                 TypedefReferrer::StructureComponent(
-                                    td_struct.name.clone(),
-                                    sc.component_name.clone(),
+                                    td_struct.get_name().to_string(),
+                                    sc.get_name().to_string(),
                                 ),
                             ));
                         td_struct.structure_component.push(sc);
@@ -1441,14 +1431,16 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
             updated = false;
             let mut idx = 0;
             while idx < self.typedef_structs.len() {
-                let opt_info_vec = self.typedef_ref_info.get(&self.typedef_structs[idx].name);
+                let opt_info_vec = self
+                    .typedef_ref_info
+                    .get(self.typedef_structs[idx].get_name());
                 if opt_info_vec.is_none() || opt_info_vec.unwrap().is_empty() {
                     for sc in &self.typedef_structs[idx].structure_component {
                         if let Some(target_info) = self.typedef_ref_info.get_mut(&sc.component_type)
                         {
                             target_info.retain(|(_, referrer)| {
                                 if let TypedefReferrer::StructureComponent(s, _) = referrer {
-                                    *s != self.typedef_structs[idx].name
+                                    s != self.typedef_structs[idx].get_name()
                                 } else {
                                     true
                                 }
@@ -1460,7 +1452,7 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
                     }
                     self.log_msgs.push(format!(
                         "removing unused TYPEDEF_STRUCTURE {}",
-                        self.typedef_structs[idx].name
+                        self.typedef_structs[idx].get_name()
                     ));
                     self.typedef_structs.swap_remove_index(idx);
                 } else {
@@ -1474,13 +1466,13 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
         while idx < self.module.typedef_characteristic.len() {
             let opt_info_vec = self
                 .typedef_ref_info
-                .get(&self.module.typedef_characteristic[idx].name);
+                .get(self.module.typedef_characteristic[idx].get_name());
             if opt_info_vec.is_none() || opt_info_vec.unwrap().is_empty() {
                 self.log_msgs.push(format!(
                     "removing unused TYPEDEF_CHARACTERISTIC {}",
-                    self.module.typedef_characteristic[idx].name
+                    self.module.typedef_characteristic[idx].get_name()
                 ));
-                self.module.typedef_characteristic.swap_remove(idx);
+                self.module.typedef_characteristic.swap_remove_idx(idx);
             } else {
                 idx += 1;
             }
@@ -1491,13 +1483,13 @@ impl<'dbg, 'a2l, 'rl, 'log, 'cm> TypedefUpdater<'dbg, 'a2l, 'rl, 'log, 'cm> {
         while idx < self.module.typedef_measurement.len() {
             let opt_info_vec = self
                 .typedef_ref_info
-                .get(&self.module.typedef_measurement[idx].name);
+                .get(self.module.typedef_measurement[idx].get_name());
             if opt_info_vec.is_none() || opt_info_vec.unwrap().is_empty() {
                 self.log_msgs.push(format!(
                     "removing unused TYPEDEF_MEASUREMENT {}",
-                    self.module.typedef_measurement[idx].name
+                    self.module.typedef_measurement[idx].get_name()
                 ));
-                self.module.typedef_measurement.swap_remove(idx);
+                self.module.typedef_measurement.swap_remove_idx(idx);
             } else {
                 idx += 1;
             }
@@ -1521,10 +1513,10 @@ fn get_typeinfo_from_symbol_link<'dbg>(
     let symbol_type = symbol_type_parts.next().unwrap();
     let mut required_compile_unit = None;
     for additional_info in symbol_type_parts {
-        if let Some(comp_unit) = additional_info.strip_prefix("CompileUnit:") {
-            if let Some(comp_unit) = comp_unit.strip_suffix('}') {
-                required_compile_unit = Some(comp_unit);
-            }
+        if let Some(comp_unit) = additional_info.strip_prefix("CompileUnit:")
+            && let Some(comp_unit) = comp_unit.strip_suffix('}')
+        {
+            required_compile_unit = Some(comp_unit);
         }
     }
 
@@ -1537,14 +1529,12 @@ fn get_typeinfo_from_symbol_link<'dbg>(
             if let Some(req_compile_unit) = required_compile_unit {
                 // try to find the correct type by comparing the compile unit name
                 for typinfo_idx in typeinfo_list {
-                    if let Some(typeinfo) = debug_data.types.get(typinfo_idx) {
-                        if let Some(simple_name) =
+                    if let Some(typeinfo) = debug_data.types.get(typinfo_idx)
+                        && let Some(simple_name) =
                             make_simple_unit_name(debug_data, typeinfo.unit_idx)
-                        {
-                            if simple_name == req_compile_unit {
-                                return Some(typeinfo);
-                            }
-                        }
+                        && simple_name == req_compile_unit
+                    {
+                        return Some(typeinfo);
                     }
                 }
                 // type was not identified by matching the compile unit name
@@ -1581,26 +1571,26 @@ fn get_structure_component_typeinfo<'dbg>(
 fn is_structure_typeinfo(typeinfo: &TypeInfo, types: &HashMap<usize, TypeInfo>) -> bool {
     let typeinfo = typeinfo.get_pointer(types).map_or(typeinfo, |(_, t)| t);
     match &typeinfo.datatype {
-        DwarfDataType::Pointer(_, offset) => {
-            if let Some(pt_type) = types.get(&offset.0) {
+        DbgDataType::Pointer(_, offset) => {
+            if let Some(pt_type) = types.get(offset) {
                 // inner type can be a pointer to anything, or a valid structure datatype
-                matches!(&pt_type.datatype, DwarfDataType::Pointer(_, _))
+                matches!(&pt_type.datatype, DbgDataType::Pointer(_, _))
                     || is_structure_typeinfo(pt_type, types)
             } else {
                 false
             }
         }
-        DwarfDataType::TypeRef(offset, _) => {
+        DbgDataType::TypeRef(offset, _) => {
             if let Some(pt_type) = types.get(offset) {
                 is_structure_typeinfo(pt_type, types)
             } else {
                 false
             }
         }
-        DwarfDataType::Struct { .. }
-        | DwarfDataType::Class { .. }
-        | DwarfDataType::Union { .. }
-        | DwarfDataType::Array { .. } => true,
+        DbgDataType::Struct { .. }
+        | DbgDataType::Class { .. }
+        | DbgDataType::Union { .. }
+        | DbgDataType::Array { .. } => true,
         _ => false,
     }
 }
@@ -1611,11 +1601,11 @@ fn is_calibration_typeinfo(typeinfo: &TypeInfo) -> bool {
     let typeinfo = typeinfo.get_arraytype().unwrap_or(typeinfo);
     !matches!(
         &typeinfo.datatype,
-        DwarfDataType::Pointer(_, _)
-            | DwarfDataType::FuncPtr(_)
-            | DwarfDataType::Other(_)
-            | DwarfDataType::Union { .. }
-            | DwarfDataType::TypeRef(_, _)
+        DbgDataType::Pointer(_, _)
+            | DbgDataType::FuncPtr(_)
+            | DbgDataType::Other(_)
+            | DbgDataType::Union { .. }
+            | DbgDataType::TypeRef(_, _)
     )
 }
 
@@ -1624,21 +1614,21 @@ fn is_measurement_typeinfo(typeinfo: &TypeInfo, types: &HashMap<usize, TypeInfo>
     let typeinfo = typeinfo.get_pointer(types).map_or(typeinfo, |(_, t)| t);
     let typeinfo = typeinfo.get_arraytype().unwrap_or(typeinfo);
     match &typeinfo.datatype {
-        DwarfDataType::Pointer(_, offset) => {
-            if let Some(pt_type) = types.get(&offset.0) {
+        DbgDataType::Pointer(_, offset) => {
+            if let Some(pt_type) = types.get(offset) {
                 // inner type must be a measurement type, except it can't be a pointer itself
-                !matches!(&pt_type.datatype, DwarfDataType::Pointer(_, _))
+                !matches!(&pt_type.datatype, DbgDataType::Pointer(_, _))
                     && is_measurement_typeinfo(pt_type, types)
             } else {
                 false
             }
         }
-        DwarfDataType::Other(_)
-        | DwarfDataType::Struct { .. }
-        | DwarfDataType::Class { .. }
-        | DwarfDataType::Union { .. }
-        | DwarfDataType::Array { .. }
-        | DwarfDataType::TypeRef(_, _) => false,
+        DbgDataType::Other(_)
+        | DbgDataType::Struct { .. }
+        | DbgDataType::Class { .. }
+        | DbgDataType::Union { .. }
+        | DbgDataType::Array { .. }
+        | DbgDataType::TypeRef(_, _) => false,
         _ => true,
     }
 }
@@ -1685,13 +1675,12 @@ fn calc_distinct_types<'a>(
 ) -> Vec<&'a TypeInfo> {
     let mut distinct_types: Vec<&TypeInfo> = vec![];
     for (typeinfo_opt, _) in ref_info {
-        if let Some(typeinfo) = typeinfo_opt {
-            if !distinct_types
+        if let Some(typeinfo) = typeinfo_opt
+            && !distinct_types
                 .iter()
                 .any(|typeinfo2| typeinfo.compare(typeinfo2, &debug_data.types))
-            {
-                distinct_types.push(typeinfo);
-            }
+        {
+            distinct_types.push(typeinfo);
         }
     }
     distinct_types
@@ -1700,7 +1689,7 @@ fn calc_distinct_types<'a>(
 /// create a suitable name for a TYPEDEF_* based on the given typeinfo
 fn make_typedef_name(debug_data: &DebugData, typeinfo: &TypeInfo, is_calib: bool) -> String {
     match &typeinfo.datatype {
-        DwarfDataType::Pointer(pt_size, pt_dbg_offset) => {
+        DbgDataType::Pointer(pt_size, pt_dbg_offset) => {
             let prefix = match pt_size {
                 1 => "BytePointer",
                 2 => "ShortPointer",
@@ -1708,7 +1697,7 @@ fn make_typedef_name(debug_data: &DebugData, typeinfo: &TypeInfo, is_calib: bool
                 8 => "LongLongPointer",
                 _ => "Pointer",
             };
-            let basename: Cow<str> = if let Some(pt_type) = debug_data.types.get(&pt_dbg_offset.0) {
+            let basename: Cow<str> = if let Some(pt_type) = debug_data.types.get(pt_dbg_offset) {
                 make_typedef_name(debug_data, pt_type, is_calib).into()
             } else if let Some(pt_name) = &typeinfo.name {
                 pt_name.into()
@@ -1717,7 +1706,7 @@ fn make_typedef_name(debug_data: &DebugData, typeinfo: &TypeInfo, is_calib: bool
             };
             format!("{prefix}_{basename}")
         }
-        DwarfDataType::Array { dim, arraytype, .. } => {
+        DbgDataType::Array { dim, arraytype, .. } => {
             let basename = make_typedef_name(debug_data, arraytype, is_calib);
             // ex: dim = [3, 4, 5] -> "Array_3_4_5"
             let mut outstr = dim.iter().fold("Array".to_string(), |mut txt, val| {
@@ -1728,32 +1717,32 @@ fn make_typedef_name(debug_data: &DebugData, typeinfo: &TypeInfo, is_calib: bool
             outstr.push_str(&basename);
             outstr
         }
-        DwarfDataType::Struct { .. } => typeinfo
+        DbgDataType::Struct { .. } => typeinfo
             .name
             .as_deref()
             .unwrap_or("_unnamed_struct_")
             .to_string(),
-        DwarfDataType::Class { .. } => {
+        DbgDataType::Class { .. } => {
             // there is no such thing as an unnamed class
             typeinfo.name.clone().unwrap()
         }
-        DwarfDataType::Union { .. } => typeinfo
+        DbgDataType::Union { .. } => typeinfo
             .name
             .as_deref()
             .unwrap_or("_unnamed_union_")
             .to_string(),
-        DwarfDataType::Enum { .. } => typeinfo
+        DbgDataType::Enum { .. } => typeinfo
             .name
             .as_deref()
             .unwrap_or("_unnamed_enum_")
             .to_string(),
-        DwarfDataType::TypeRef(offset, _) => debug_data
+        DbgDataType::TypeRef(offset, _) => debug_data
             .types
             .get(offset)
             .map_or("_invalid_reference_".to_string(), |t| {
                 make_typedef_name(debug_data, t, is_calib)
             }),
-        DwarfDataType::FuncPtr(_) | DwarfDataType::Other(_) => {
+        DbgDataType::FuncPtr(_) | DbgDataType::Other(_) => {
             // BLOBs might refer to void pointers, which can be represented as Other()
             typeinfo
                 .name
@@ -1761,17 +1750,17 @@ fn make_typedef_name(debug_data: &DebugData, typeinfo: &TypeInfo, is_calib: bool
                 .unwrap_or("_unnamed_item_")
                 .to_string()
         }
-        DwarfDataType::Uint8 => make_basic_name(is_calib, "UByte"),
-        DwarfDataType::Uint16 => make_basic_name(is_calib, "UWord"),
-        DwarfDataType::Uint32 => make_basic_name(is_calib, "ULong"),
-        DwarfDataType::Uint64 => make_basic_name(is_calib, "UInt64"),
-        DwarfDataType::Sint8 => make_basic_name(is_calib, "SByte"),
-        DwarfDataType::Sint16 => make_basic_name(is_calib, "SWord"),
-        DwarfDataType::Sint32 => make_basic_name(is_calib, "SLong"),
-        DwarfDataType::Sint64 => make_basic_name(is_calib, "SInt64"),
-        DwarfDataType::Float => make_basic_name(is_calib, "Float32"),
-        DwarfDataType::Double => make_basic_name(is_calib, "Double"),
-        DwarfDataType::Bitfield {
+        DbgDataType::Uint8 => make_basic_name(is_calib, "UByte"),
+        DbgDataType::Uint16 => make_basic_name(is_calib, "UWord"),
+        DbgDataType::Uint32 => make_basic_name(is_calib, "ULong"),
+        DbgDataType::Uint64 => make_basic_name(is_calib, "UInt64"),
+        DbgDataType::Sint8 => make_basic_name(is_calib, "SByte"),
+        DbgDataType::Sint16 => make_basic_name(is_calib, "SWord"),
+        DbgDataType::Sint32 => make_basic_name(is_calib, "SLong"),
+        DbgDataType::Sint64 => make_basic_name(is_calib, "SInt64"),
+        DbgDataType::Float => make_basic_name(is_calib, "Float32"),
+        DbgDataType::Double => make_basic_name(is_calib, "Double"),
+        DbgDataType::Bitfield {
             basetype,
             bit_offset,
             bit_size,
@@ -1800,18 +1789,18 @@ fn fully_unwrap_typeinfo<'dbg>(
     // fully unwrap all indirections, until the type is not one of Pointer / Array / TypeRef
     loop {
         match &cur_typeinfo.datatype {
-            DwarfDataType::Pointer(_, off) => {
+            DbgDataType::Pointer(_, off) => {
                 // for void* the off may be 0, then debug_data.types.get() fails
-                if let Some(ptype) = debug_data.types.get(&off.0) {
+                if let Some(ptype) = debug_data.types.get(off) {
                     cur_typeinfo = ptype;
                 } else {
                     return None;
                 }
             }
-            DwarfDataType::Array { arraytype, .. } => {
+            DbgDataType::Array { arraytype, .. } => {
                 cur_typeinfo = arraytype;
             }
-            DwarfDataType::TypeRef(off, _) => {
+            DbgDataType::TypeRef(off, _) => {
                 if let Some(reftype) = debug_data.types.get(off) {
                     cur_typeinfo = reftype;
                 } else {
@@ -1825,13 +1814,13 @@ fn fully_unwrap_typeinfo<'dbg>(
 
 #[cfg(test)]
 mod test {
-    use super::{update_module_typedefs, TypedefUpdater};
+    use super::{TypedefUpdater, update_module_typedefs};
     use crate::{
-        dwarf::{DebugData, TypeInfo},
-        update::{get_symbol_info, RecordLayoutInfo, TypedefNames, TypedefReferrer, UpdateInfo},
         A2lVersion,
+        debuginfo::{DebugData, TypeInfo},
+        update::{A2lUpdateInfo, RecordLayoutInfo, TypedefNames, TypedefReferrer, get_symbol_info},
     };
-    use a2lfile::A2lFile;
+    use a2lfile::{A2lFile, A2lObjectName};
     use std::{
         collections::{HashMap, HashSet},
         ffi::OsString,
@@ -1841,9 +1830,9 @@ mod test {
         a2l_name: &str,
         elf_name: &str,
     ) -> (A2lFile, DebugData, TypedefNames, RecordLayoutInfo) {
-        let mut log_msgs = Vec::new();
-        let a2l = a2lfile::load(a2l_name, None, &mut log_msgs, true).unwrap();
-        let debug_data = crate::dwarf::DebugData::load(&OsString::from(elf_name), false).unwrap();
+        let (a2l, _) = a2lfile::load(a2l_name, None, true).unwrap();
+        let debug_data =
+            crate::debuginfo::DebugData::load_dwarf(&OsString::from(elf_name), false).unwrap();
         let typedef_names = TypedefNames::new(&a2l.project.module[0]);
         let recordlayout_info = RecordLayoutInfo::build(&a2l.project.module[0]);
         (a2l, debug_data, typedef_names, recordlayout_info)
@@ -1851,10 +1840,11 @@ mod test {
 
     #[test]
     fn test_calc_structure_category() {
-        let (mut a2l, debug_data, names, mut reclayout) =
-            test_setup("tests/update_test1.a2l", "tests/elffiles/update_test.elf");
+        let (mut a2l, debug_data, names, mut reclayout) = test_setup(
+            "fixtures/a2l/update_typedef_test1.a2l",
+            "fixtures/bin/update_typedef_test.elf",
+        );
         let mut msgs = Vec::new();
-        let dummy_cm_index = HashMap::new();
         let mut tdu = TypedefUpdater::new(
             &mut a2l.project.module[0],
             &debug_data,
@@ -1862,7 +1852,6 @@ mod test {
             names,
             &mut reclayout,
             HashMap::new(),
-            &dummy_cm_index,
         );
 
         tdu.typedef_names.structure = HashSet::new();
@@ -1881,16 +1870,17 @@ mod test {
         );
         assert!(!(*tdu.is_calib_struct.get("DeadEnd").unwrap()));
         assert!(!(*tdu.is_calib_struct.get("DeadEnd2").unwrap()));
-        assert!(tdu.is_calib_struct.get("Unconnected").is_none());
+        assert!(!tdu.is_calib_struct.contains_key("Unconnected"));
     }
 
     #[test]
     fn test_build_structure_hash() {
-        let (mut a2l, debug_data, names, mut reclayout) =
-            test_setup("tests/update_test1.a2l", "tests/elffiles/update_test.elf");
+        let (mut a2l, debug_data, names, mut reclayout) = test_setup(
+            "fixtures/a2l/update_typedef_test1.a2l",
+            "fixtures/bin/update_typedef_test.elf",
+        );
         let num_structs = a2l.project.module[0].typedef_structure.len();
         let mut msgs = Vec::new();
-        let dummy_cm_index = HashMap::new();
         let mut tdu = TypedefUpdater::new(
             &mut a2l.project.module[0],
             &debug_data,
@@ -1898,7 +1888,6 @@ mod test {
             names,
             &mut reclayout,
             HashMap::new(),
-            &dummy_cm_index,
         );
 
         tdu.typedef_names.structure = HashSet::new();
@@ -1909,9 +1898,10 @@ mod test {
         assert!(tdu.typedef_structs.contains_key("RegDef"));
         assert!(tdu.typedef_structs.contains_key("TestStruct"));
         assert!(tdu.typedef_structs.contains_key("LongPointer_TestStruct"));
-        assert!(tdu
-            .typedef_structs
-            .contains_key("LongPointer_Array_10_TestStruct"));
+        assert!(
+            tdu.typedef_structs
+                .contains_key("LongPointer_Array_10_TestStruct")
+        );
 
         assert!(tdu.preserved_structs.contains_key("Unconnected"));
         assert!(tdu.preserved_structs.contains_key("DeadEnd"));
@@ -1925,10 +1915,11 @@ mod test {
 
     #[test]
     fn test_process_structure_components() {
-        let (mut a2l, debug_data, names, mut reclayout) =
-            test_setup("tests/update_test2.a2l", "tests/elffiles/update_test.elf");
+        let (mut a2l, debug_data, names, mut reclayout) = test_setup(
+            "fixtures/a2l/update_typedef_test2.a2l",
+            "fixtures/bin/update_typedef_test.elf",
+        );
         let mut msgs = Vec::new();
-        let dummy_cm_index = HashMap::new();
         let mut tdu = TypedefUpdater::new(
             &mut a2l.project.module[0],
             &debug_data,
@@ -1936,7 +1927,6 @@ mod test {
             names,
             &mut reclayout,
             HashMap::new(),
-            &dummy_cm_index,
         );
 
         tdu.typedef_names.structure = HashSet::new();
@@ -1953,21 +1943,23 @@ mod test {
         let struct_a = tdu.typedef_structs.get("StructA").unwrap();
         let struct_b = tdu.typedef_structs.get("StructB").unwrap();
         // the "nonexistent_nothing" STRUCTURE_COMPONENTs in both structs were removed
-        assert!(!struct_a
-            .structure_component
-            .iter()
-            .any(|sc| sc.component_name == "nonexistent_nothing"));
-        assert!(!struct_b
-            .structure_component
-            .iter()
-            .any(|sc| sc.component_name == "nonexistent_nothing"));
+        assert!(
+            !struct_a
+                .structure_component
+                .contains_key("nonexistent_nothing")
+        );
+        assert!(
+            !struct_b
+                .structure_component
+                .contains_key("nonexistent_nothing")
+        );
     }
 
     #[test]
     fn test_create_missing_instance_targets() {
         let mut a2l = a2lfile::new();
-        let elf_name = OsString::from("tests/elffiles/update_test.elf");
-        let debug_data = crate::dwarf::DebugData::load(&elf_name, false).unwrap();
+        let elf_name = OsString::from("fixtures/bin/update_typedef_test.elf");
+        let debug_data = crate::debuginfo::DebugData::load_dwarf(&elf_name, false).unwrap();
         let typedef_names = TypedefNames::new(&a2l.project.module[0]);
         let mut recordlayout_info = RecordLayoutInfo::build(&a2l.project.module[0]);
 
@@ -1994,7 +1986,6 @@ mod test {
             .push((Some(structb_typeinfo), TypedefReferrer::Instance(0)));
 
         let mut msgs = Vec::new();
-        let dummy_cm_index = HashMap::new();
         let mut tdu = TypedefUpdater::new(
             &mut a2l.project.module[0],
             &debug_data,
@@ -2002,7 +1993,6 @@ mod test {
             typedef_names,
             &mut recordlayout_info,
             typedef_ref_info,
-            &dummy_cm_index,
         );
 
         tdu.typedef_names.structure = HashSet::new();
@@ -2022,12 +2012,11 @@ mod test {
     #[test]
     fn test_create_typedef() {
         let mut a2l = a2lfile::new();
-        let elf_name = OsString::from("tests/elffiles/update_test.elf");
-        let debug_data = crate::dwarf::DebugData::load(&elf_name, false).unwrap();
+        let elf_name = OsString::from("fixtures/bin/update_typedef_test.elf");
+        let debug_data = crate::debuginfo::DebugData::load_dwarf(&elf_name, false).unwrap();
         let typedef_names = TypedefNames::new(&a2l.project.module[0]);
         let mut recordlayout_info = RecordLayoutInfo::build(&a2l.project.module[0]);
         let mut msgs = Vec::new();
-        let dummy_cm_index = HashMap::new();
         let mut tdu = TypedefUpdater::new(
             &mut a2l.project.module[0],
             &debug_data,
@@ -2035,7 +2024,6 @@ mod test {
             typedef_names,
             &mut recordlayout_info,
             HashMap::new(),
-            &dummy_cm_index,
         );
         let mut enum_convlist = HashMap::<String, &TypeInfo>::new();
 
@@ -2097,12 +2085,11 @@ mod test {
     #[test]
     fn test_create_typedef2() {
         let mut a2l = a2lfile::new();
-        let elf_name = OsString::from("tests/elffiles/update_test.elf");
-        let debug_data = crate::dwarf::DebugData::load(&elf_name, false).unwrap();
+        let elf_name = OsString::from("fixtures/bin/update_typedef_test.elf");
+        let debug_data = crate::debuginfo::DebugData::load_dwarf(&elf_name, false).unwrap();
         let typedef_names = TypedefNames::new(&a2l.project.module[0]);
         let mut recordlayout_info = RecordLayoutInfo::build(&a2l.project.module[0]);
         let mut msgs = Vec::new();
-        let dummy_cm_index = HashMap::new();
         let mut tdu = TypedefUpdater::new(
             &mut a2l.project.module[0],
             &debug_data,
@@ -2110,7 +2097,6 @@ mod test {
             typedef_names,
             &mut recordlayout_info,
             HashMap::new(),
-            &dummy_cm_index,
         );
         let mut enum_convlist = HashMap::<String, &TypeInfo>::new();
 
@@ -2137,14 +2123,20 @@ mod test {
 
     #[test]
     fn test_update() {
-        let (mut a2l, debug_data, names, reclayout) =
-            test_setup("tests/update_test3.a2l", "tests/elffiles/update_test.elf");
+        let (mut a2l, debug_data, names, mut reclayout) = test_setup(
+            "fixtures/a2l/update_typedef_test3.a2l",
+            "fixtures/bin/update_typedef_test.elf",
+        );
 
         let mut typedef_ref_info: HashMap<String, Vec<_>> = HashMap::new();
         for (idx, inst) in a2l.project.module[0].instance.iter().enumerate() {
-            if let Ok(sym_info) =
-                get_symbol_info(&inst.name, &inst.symbol_link, &inst.if_data, &debug_data)
-            {
+            if let Ok(sym_info) = get_symbol_info(
+                inst.get_name(),
+                &inst.symbol_link,
+                &inst.if_data,
+                &debug_data,
+                false,
+            ) {
                 let typeinfo = sym_info
                     .typeinfo
                     .get_pointer(&debug_data.types)
@@ -2159,19 +2151,26 @@ mod test {
 
         let version = A2lVersion::from(&a2l);
         let mut log_msgs = Vec::new();
-        let mut info = UpdateInfo {
-            module: &mut a2l.project.module[0],
+        let info = A2lUpdateInfo {
             debug_data: &debug_data,
-            log_msgs: &mut log_msgs,
             preserve_unknown: false,
+            strict_update: false,
+            full_update: true,
             version,
-            reclayout_info: reclayout,
+            enable_structures: true,
+            use_new_arrays: false,
         };
-        update_module_typedefs(&mut info, typedef_ref_info, names, &HashMap::new());
+        update_module_typedefs(
+            &info,
+            &mut a2l.project.module[0],
+            &mut log_msgs,
+            typedef_ref_info,
+            names,
+            &mut reclayout,
+        );
 
-        let mut log_msgs = Vec::new();
-        let mut reference_a2l =
-            a2lfile::load("tests/update_test4.a2l", None, &mut log_msgs, true).unwrap();
+        let (mut reference_a2l, _) =
+            a2lfile::load("fixtures/a2l/update_typedef_test4.a2l", None, true).unwrap();
 
         // ordering is not guaranteed, so sort both files before comparing them
         a2l.sort();

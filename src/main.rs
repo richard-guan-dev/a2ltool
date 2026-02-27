@@ -1,17 +1,20 @@
-use clap::{builder::ValueParser, parser::ValuesRef, Arg, ArgGroup, ArgMatches, Command};
+use clap::{Arg, ArgGroup, ArgMatches, Command, builder::ValueParser, parser::ValuesRef};
 
-use a2lfile::{A2lError, A2lFile, A2lObject};
-use dwarf::DebugData;
+use a2lfile::{A2lError, A2lFile, A2lObject, A2ml, itemlist};
+use debuginfo::DebugData;
 use std::{
     ffi::{OsStr, OsString},
     fmt::Display,
     time::Instant,
 };
+use update::{UpdateMode, UpdateType};
 
+mod creator;
 mod datatype;
-mod dwarf;
+mod debuginfo;
 mod ifdata;
 mod insert;
+mod remove;
 mod symbol;
 mod update;
 mod version;
@@ -25,6 +28,13 @@ pub enum A2lVersion {
     V1_6_1,
     V1_7_0,
     V1_7_1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MergePref {
+    Existing,
+    New,
+    Both,
 }
 
 macro_rules! cond_print {
@@ -60,26 +70,19 @@ macro_rules! ext_println {
 }
 
 fn main() {
-    match core() {
+    let args = std::env::args_os();
+    match core(args) {
         Ok(()) => {}
-        Err(err) => println!("{err}"),
+        Err(err) => {
+            println!("{err}");
+            std::process::exit(1);
+        }
     }
 }
 
 // Implement all the operations supported by a2ltool
-// They will always be performed in this order:
-//  1) load input
-//  2) additional consistency checks
-//  3) load elf
-//  4) merge at the module level
-//  5) merge at the project level
-//  6) merge includes (flatten)
-//  7) update addresses
-//  8) clean up ifdata
-//  9) sort the file
-// 10) output
-fn core() -> Result<(), String> {
-    let arg_matches = get_args();
+fn core(args: impl Iterator<Item = OsString>) -> Result<(), String> {
+    let arg_matches = parse_args(args);
 
     let strict = *arg_matches
         .get_one::<bool>("STRICT")
@@ -93,15 +96,12 @@ fn core() -> Result<(), String> {
     let show_xcp = *arg_matches
         .get_one::<bool>("SHOW_XCP")
         .expect("option show-xcp must always exist");
-    let update = *arg_matches
-        .get_one::<bool>("UPDATE")
-        .expect("option update must always exist");
-    let update_preserve = *arg_matches
-        .get_one::<bool>("SAFE_UPDATE")
-        .expect("option update-preserve must always exist");
     let enable_structures = *arg_matches
         .get_one::<bool>("ENABLE_STRUCTURES")
         .expect("option enable-structures must always exist");
+    let force_old_arrays = *arg_matches
+        .get_one::<bool>("OLD_ARRAYS")
+        .expect("option old-arrays must always exist");
     let cleanup = *arg_matches
         .get_one::<bool>("CLEANUP")
         .expect("option cleanup must always exist");
@@ -114,7 +114,15 @@ fn core() -> Result<(), String> {
     let merge_includes = *arg_matches
         .get_one::<bool>("MERGEINCLUDES")
         .expect("option merge-includes must always exist");
+    let insert_a2ml = *arg_matches
+        .get_one::<bool>("INSERT_A2ML")
+        .expect("option insert-a2ml must always exist");
     let verbose = arg_matches.get_count("VERBOSE");
+    let opt_update_type = arg_matches.get_one::<UpdateType>("UPDATE_TYPE");
+
+    if let Some(true) = arg_matches.get_one::<bool>("SAFE_UPDATE") {
+        return Err("Error: The option --update-preserve is deprecated. Use --update-mode PRESERVE instead.".to_string());
+    }
 
     let now = Instant::now();
     cond_print!(
@@ -136,39 +144,6 @@ fn core() -> Result<(), String> {
         xcp::show_settings(&a2l_file, input_filename);
     }
 
-    // additional consistency checks
-    if check {
-        cond_print!(
-            verbose,
-            now,
-            format!(
-                "Performing consistency check for {}.",
-                input_filename.to_string_lossy()
-            )
-        );
-        let mut log_msgs = Vec::<String>::new();
-        a2l_file.check(&mut log_msgs);
-        if log_msgs.is_empty() {
-            ext_println!(
-                verbose,
-                now,
-                "Consistency check complete. No problems found."
-            );
-        } else {
-            for msg in &log_msgs {
-                ext_println!(verbose, now, format!("    {}", msg));
-            }
-            ext_println!(
-                verbose,
-                now,
-                format!(
-                    "Consistency check complete. {} problems reported.",
-                    log_msgs.len()
-                )
-            );
-        }
-    }
-
     // convert/downgrade the file to some version
     if let Some(new_a2l_version) = arg_matches.get_one::<A2lVersion>("A2LVERSION") {
         version::convert(&mut a2l_file, *new_a2l_version);
@@ -176,59 +151,96 @@ fn core() -> Result<(), String> {
 
     let current_version = A2lVersion::from(&a2l_file);
     if enable_structures && current_version < A2lVersion::V1_7_1 {
-        return Err(format!("Error: The option --enable-structures requires input file version 1.7.1, but the current version is {current_version}"));
+        return Err(format!(
+            "Error: The option --enable-structures requires input file version 1.7.1, but the current version is {current_version}"
+        ));
     }
 
-    // load elf
-    let elf_info = if let Some(elffile) = arg_matches.get_one::<OsString>("ELFFILE") {
-        let elf_info = DebugData::load(elffile, verbose > 0)?;
+    // load debuginfo from an elf or pdb file
+    let opt_elffile = arg_matches.get_one::<OsString>("ELFFILE");
+    let opt_pdbfile = arg_matches.get_one::<OsString>("PDBFILE");
+    let debuginfo = if let Some(elffile) = opt_elffile {
+        Some(DebugData::load_dwarf(elffile, verbose > 0)?)
+    } else if let Some(pdbfile) = opt_pdbfile {
+        Some(DebugData::load_pdb(pdbfile, verbose > 0)?)
+    } else {
+        None
+    };
+    // display statistics and debug data if requested
+    if let Some(debuginfo) = &debuginfo {
+        // either opt_elffile or opt_pdbfile must be present if debuginfo was loaded
+        let filename = opt_elffile.or(opt_pdbfile).unwrap();
         cond_print!(
             verbose,
             now,
             format!(
                 "Variables and types loaded from \"{}\": {} variables available",
-                elffile.to_string_lossy(),
-                elf_info.variables.len()
+                filename.to_string_lossy(),
+                debuginfo.variables.len()
             )
         );
         if debugprint {
-            println!("================\n{elf_info:#?}\n================\n");
+            println!("================\n{debuginfo:#?}\n================\n");
         }
-        Some(elf_info)
-    } else {
-        None
-    };
+    }
 
     // merge at the module level
     if let Some(merge_modules) = arg_matches.get_many::<OsString>("MERGEMODULE") {
-        for mergemodule in merge_modules {
-            let mut merge_log_msgs = Vec::<A2lError>::new();
-            let mergeresult = a2lfile::load(mergemodule, None, &mut merge_log_msgs, strict);
-            if let Ok(mut merge_a2l) = mergeresult {
-                a2l_file.merge_modules(&mut merge_a2l);
+        let merge_pref = arg_matches
+            .get_one::<MergePref>("MERGEPREF")
+            .cloned()
+            .unwrap_or(MergePref::Both);
+        for merge_module_path in merge_modules {
+            let load_result = a2lfile::load(
+                merge_module_path,
+                Some(ifdata::A2MLVECTOR_TEXT.to_string()),
+                strict,
+            );
+
+            if let Ok((mut merge_a2l, load_log_msgs)) = load_result {
+                // display any log messages from the load
+                for msg in load_log_msgs {
+                    cond_print!(verbose, now, msg.to_string());
+                }
+                // merge the module
+                let merge_module = &mut merge_a2l.project.module[0];
+                match merge_pref {
+                    MergePref::Existing => a2l_file.project.module[0].import_new(merge_module),
+                    MergePref::New => a2l_file.project.module[0].import_all(merge_module),
+                    MergePref::Both => a2l_file.project.module[0].merge(merge_module),
+                }
+                // merge_helper(merge_pref, &mut a2l_file, merge_module);
                 cond_print!(
                     verbose,
                     now,
                     format!(
                         "Merged A2l objects from \"{}\"\n",
-                        mergemodule.to_string_lossy()
+                        merge_module_path.to_string_lossy()
                     )
                 );
-            } else if let Ok(mut other_module) = a2lfile::load_fragment_file(mergemodule) {
-                a2l_file.project.module[0].merge(&mut other_module);
+            } else if let Ok(mut other_module) = a2lfile::load_fragment_file(
+                merge_module_path,
+                Some(ifdata::A2MLVECTOR_TEXT.to_string()),
+            ) {
+                // failed to load the file as a full A2L file, but loaded it as a module fragment
+                match merge_pref {
+                    MergePref::Existing => a2l_file.project.module[0].import_new(&mut other_module),
+                    MergePref::New => a2l_file.project.module[0].import_all(&mut other_module),
+                    MergePref::Both => a2l_file.project.module[0].merge(&mut other_module),
+                }
                 cond_print!(
                     verbose,
                     now,
                     format!(
                         "Merged A2l objects from \"{}\"\n",
-                        mergemodule.to_string_lossy()
+                        merge_module_path.to_string_lossy()
                     )
                 );
             } else {
                 return Err(format!(
                     "Failed to load \"{}\" for merging: {}\n",
-                    mergemodule.to_string_lossy(),
-                    mergeresult.unwrap_err()
+                    merge_module_path.to_string_lossy(),
+                    load_result.unwrap_err()
                 ));
             }
         }
@@ -237,9 +249,8 @@ fn core() -> Result<(), String> {
     // merge at the project level
     if let Some(merge_projects) = arg_matches.get_many::<OsString>("MERGEPROJECT") {
         for mergeproject in merge_projects {
-            let mut merge_log_msgs = Vec::<A2lError>::new();
-            let merge_a2l = a2lfile::load(mergeproject, None, &mut merge_log_msgs, strict)
-                .map_err(|a2lerr| a2lerr.to_string())?;
+            let (merge_a2l, _) =
+                a2lfile::load(mergeproject, None, strict).map_err(|a2lerr| a2lerr.to_string())?;
 
             a2l_file.project.module.extend(merge_a2l.project.module);
             cond_print!(
@@ -260,20 +271,98 @@ fn core() -> Result<(), String> {
         cond_print!(verbose, now, "Include directives have been merged\n");
     }
 
-    if let Some(debugdata) = &elf_info {
+    // remove items if --remove or --remove-range was given
+    if arg_matches.contains_id("REMOVE_RANGE") || arg_matches.contains_id("REMOVE_REGEX") {
+        let mut total_removed = 0;
+        let ranges: Vec<(u64, u64)> =
+            range_args_to_ranges(arg_matches.get_many::<u64>("REMOVE_RANGE"));
+
+        if !ranges.is_empty() {
+            let (log_msgs, removed_count) = remove::remove_address_ranges(&mut a2l_file, &ranges);
+            for msg in log_msgs {
+                cond_print!(verbose, now, msg);
+            }
+            total_removed += removed_count;
+        }
+
+        let regexes: Vec<&str> = match arg_matches.get_many::<String>("REMOVE_REGEX") {
+            Some(values) => values.map(|x| &**x).collect(),
+            None => Vec::new(),
+        };
+
+        if !regexes.is_empty() {
+            let (log_msgs, removed_count) = remove::remove_items(&mut a2l_file, &regexes);
+            for msg in log_msgs {
+                cond_print!(verbose, now, msg);
+            }
+            total_removed += removed_count;
+        }
+        cond_print!(verbose, now, format!("Removed {} items", total_removed));
+    }
+
+    // create items based on comments in source files
+    // We're supporting  the same syntax as the Vector ASAP2 creator.
+    if let Some(source_file_patterns) = arg_matches.get_many::<OsString>("FROM_SOURCE") {
+        let target_group = arg_matches.get_one::<String>("TARGET_GROUP").cloned();
+        let result = creator::create_items_from_sources(
+            &mut a2l_file,
+            source_file_patterns,
+            target_group,
+            enable_structures,
+            force_old_arrays,
+        );
+
+        match result {
+            Ok((warnings, log_msgs)) => {
+                for msg in log_msgs {
+                    cond_print!(verbose, now, msg);
+                }
+                cond_print!(
+                    verbose,
+                    now,
+                    format!("Item creation from source files complete. {warnings} warnings.")
+                );
+                if strict && warnings > 0 {
+                    return Err(format!(
+                        "Exiting because {warnings} warnings were found in strict mode."
+                    ));
+                }
+            }
+            Err(log_msgs) => {
+                let verbose = if verbose > 0 { verbose } else { 1 };
+                for msg in log_msgs {
+                    cond_print!(verbose, now, msg);
+                }
+                return Err("Exiting because errors were found during item creation.".to_string());
+            }
+        }
+    }
+
+    if let Some(debugdata) = &debuginfo {
         // update addresses
-        if update || update_preserve {
+        if let Some(update_type) = opt_update_type {
+            let update_mode = arg_matches
+                .get_one::<UpdateMode>("UPDATE_MODE")
+                .unwrap_or(&UpdateMode::Default);
+
             let mut log_msgs = Vec::<String>::new();
-            let summary = update::update_addresses(
+            let (summary, strict_error) = update::update_a2l(
                 &mut a2l_file,
                 debugdata,
                 &mut log_msgs,
-                update_preserve,
+                *update_type,
+                *update_mode,
                 enable_structures,
+                force_old_arrays,
             );
 
-            for msg in log_msgs {
-                cond_print!(verbose, now, msg);
+            let display_msg = if verbose > 0 || update_mode != &UpdateMode::Strict {
+                verbose
+            } else {
+                1
+            };
+            for msg in &log_msgs {
+                cond_print!(display_msg, now, msg);
             }
 
             cond_print!(verbose, now, "Address update done\nSummary:");
@@ -317,6 +406,11 @@ fn core() -> Result<(), String> {
                     summary.instance_updated, summary.instance_not_updated
                 )
             );
+
+            // in strict mode, exit with error if there are any problems
+            if update_mode == &UpdateMode::Strict && strict_error {
+                return Err("Exiting because strict mode is enabled.".to_string());
+            }
         }
 
         // create new items
@@ -437,6 +531,7 @@ fn core() -> Result<(), String> {
                 target_group,
                 &mut log_msgs,
                 enable_structures,
+                force_old_arrays,
             );
             for msg in log_msgs {
                 cond_print!(verbose, now, msg);
@@ -454,6 +549,21 @@ fn core() -> Result<(), String> {
         );
     }
 
+    if insert_a2ml {
+        if a2l_file.project.module[0].a2ml.is_none() {
+            // insert the built-in A2ML definition. An extra newline at the start makes it look better
+            let a2ml_string = format!("\n{}", ifdata::A2MLVECTOR_TEXT);
+            a2l_file.project.module[0].a2ml = Some(A2ml::new(a2ml_string));
+            cond_print!(verbose, now, "Inserted A2ML definition");
+        } else {
+            cond_print!(
+                verbose,
+                now,
+                "A2ML definition already exists, not inserting"
+            );
+        }
+    }
+
     // remove unknown IF_DATA
     if ifdata_cleanup {
         a2l_file.ifdata_cleanup();
@@ -464,6 +574,43 @@ fn core() -> Result<(), String> {
     if sort {
         a2l_file.sort();
         cond_print!(verbose, now, "All objects have been sorted");
+    }
+
+    // additional consistency checks
+    if check {
+        cond_print!(
+            verbose,
+            now,
+            format!(
+                "Performing consistency check for {}.",
+                input_filename.to_string_lossy()
+            )
+        );
+        let log_msgs = a2l_file.check();
+        if log_msgs.is_empty() {
+            ext_println!(
+                verbose,
+                now,
+                "Consistency check complete. No problems found."
+            );
+        } else {
+            for msg in &log_msgs {
+                ext_println!(verbose, now, format!("    {}", msg));
+            }
+            ext_println!(
+                verbose,
+                now,
+                format!(
+                    "Consistency check complete. {} problems reported.",
+                    log_msgs.len()
+                )
+            );
+
+            // in strict mode, exit with error if there are any problems
+            if strict {
+                return Err("Exiting because strict mode is enabled.".to_string());
+            }
+        }
     }
 
     // output
@@ -496,15 +643,13 @@ fn load_or_create_a2l(
     now: Instant,
 ) -> Result<(&std::ffi::OsStr, a2lfile::A2lFile), String> {
     if let Some(input_filename) = arg_matches.get_one::<OsString>("INPUT") {
-        let mut log_msgs = Vec::<A2lError>::new();
         let a2lresult = a2lfile::load(
             input_filename,
             Some(ifdata::A2MLVECTOR_TEXT.to_string()),
-            &mut log_msgs,
             strict,
         );
         let a2l_file = match a2lresult {
-            Ok(a2l_file) => {
+            Ok((a2l_file, log_msgs)) => {
                 for msg in log_msgs {
                     cond_print!(verbose, now, msg.to_string());
                 }
@@ -517,7 +662,10 @@ fn load_or_create_a2l(
                 },
             ) if block == "A2L_FILE" => {
                 // parse error in the outermost block "A2L_FILE" could indicate that this is an a2l fragment containing only the content of a MODULE
-                if let Ok(module) = a2lfile::load_fragment_file(input_filename) {
+                if let Ok(module) = a2lfile::load_fragment_file(
+                    input_filename,
+                    Some(ifdata::A2MLVECTOR_TEXT.to_string()),
+                ) {
                     // successfully loaded a module, now upgrade it to a full file
                     let mut a2l_file = a2lfile::new();
                     a2l_file.project.module[0] = module;
@@ -546,7 +694,7 @@ fn load_or_create_a2l(
             "new_project".to_string(),
             "description of project".to_string(),
         );
-        project.module = vec![a2lfile::Module::new(
+        project.module = itemlist![a2lfile::Module::new(
             "new_module".to_string(),
             String::new(),
         )];
@@ -566,8 +714,7 @@ fn load_or_create_a2l(
 
 // set up the entire command line handling.
 // fortunately clap makes this painless
-fn get_args() -> ArgMatches {
-    let args = std::env::args_os();
+fn parse_args(args: impl Iterator<Item = OsString>) -> ArgMatches {
     let args = argfile::expand_args_from(args, argfile::parse_response, argfile::PREFIX)
         .unwrap_or_else(|err| {
             println!("invalid response file: {err}: {}", err.kind());
@@ -588,12 +735,22 @@ fn get_args() -> ArgMatches {
         .action(clap::ArgAction::SetTrue)
     )
     .arg(Arg::new("ELFFILE")
-        .help("Elf file containing symbols and address information")
+        .help("Elf file containing symbols and address information in DWARF2+ format.\nAn exe file produced by MinGW with DWARF2 debug info can also be used.")
         .short('e')
         .long("elffile")
         .number_of_values(1)
         .value_name("ELFFILE")
         .value_parser(ValueParser::os_string())
+        .alias("exefile")
+        .alias("elf")
+    )
+    .arg(Arg::new("PDBFILE")
+        .help("PDB file containig debugging information in Microsoft's Program Database format.")
+        .long("pdbfile")
+        .number_of_values(1)
+        .value_name("PDBFILE")
+        .value_parser(ValueParser::os_string())
+        .alias("pdb")
     )
     .arg(Arg::new("CHECK")
         .help("Perform additional consistency checks")
@@ -618,9 +775,20 @@ fn get_args() -> ArgMatches {
         .value_parser(ValueParser::os_string())
         .action(clap::ArgAction::Append)
     )
+    .arg(Arg::new("MERGEPREF")
+        .help("Choose how to handle conflicts when merging MODULES. PREF can be one of:
+  EXISTING: Keep the existing item
+  NEW: Use the new item from the merge file.
+  BOTH: keep both items, renaming the new item if necessary (default)")
+        .long("merge-preference")
+        .number_of_values(1)
+        .value_name("PREF")
+        .value_parser(MergePrefParser)
+        .action(clap::ArgAction::Set)
+        .requires("MERGEMODULE")
+    )
     .arg(Arg::new("MERGEPROJECT")
         .help("Merge another a2l file on the PROJECT level.\nIf the input file contains m MODULES and the merge file contains n MODULES, then there will be m + n MODULEs in the output.")
-        .short('p')
         .long("merge-project")
         .number_of_values(1)
         .value_name("A2LFILE")
@@ -635,20 +803,38 @@ fn get_args() -> ArgMatches {
         .number_of_values(0)
         .action(clap::ArgAction::SetTrue)
     )
-    .arg(Arg::new("UPDATE")
-        .help("Update the addresses of all objects in the A2L file based on the elf file.\nObjects that cannot be found in the elf file will be deleted.\nThe arg --elffile must be present.")
+    .arg(Arg::new("UPDATE_TYPE")
+        .help("Update the A2L file based on the elf file. The update type can be one of:
+  FULL: Update the address and type info of all items. This is the default.
+  ADDRESSES: Update only the addresses.
+The arg --elffile must be present.")
         .short('u')
         .long("update")
-        .number_of_values(0)
-        .action(clap::ArgAction::SetTrue)
-        .requires("ELFFILE")
+        .value_parser(UpdateTypeParser)
+        .num_args(0..=1)
+        .action(clap::ArgAction::Append)
+        .default_missing_value("FULL")
+        .requires("DEBUGINFO_ARGGROUP")
+    )
+    .arg(Arg::new("UPDATE_MODE")
+        .help("Update the A2L file based on the elf file. Action can be one of:
+  DEFAULT: Unknown objects are removed, invalid settings are updated.
+  STRICT: Unknown objects or invalid settings trigger an error.
+  PRESERVE: Unknown objects are preserved, with the address set to zero.
+The arg --update must be present.")
+        .long("update-mode")
+        .value_parser(UpdateModeParser)
+        .num_args(0..=1)
+        .action(clap::ArgAction::Append)
+        .default_missing_value("DEFAULT")
+        .requires("DEBUGINFO_ARGGROUP")
+        .requires("UPDATE_TYPE")
     )
     .arg(Arg::new("SAFE_UPDATE")
-        .help("Update the addresses of all objects in the A2L file based on the elf file.\nObjects that cannot be found in the elf file will be preserved; their adresses will be set to zero.\nThe arg --elffile must be present.")
         .long("update-preserve")
         .number_of_values(0)
         .action(clap::ArgAction::SetTrue)
-        .requires("ELFFILE")
+        .hide(true)
     )
     .arg(Arg::new("ENABLE_STRUCTURES")
         .help("Enable the the use of INSTANCE, TYPEDEF_STRUCTURE & co. for all operations. Requires a2l version 1.7.1")
@@ -656,7 +842,12 @@ fn get_args() -> ArgMatches {
         .long("enable-structures")
         .number_of_values(0)
         .action(clap::ArgAction::SetTrue)
-        .requires("ELFFILE")
+    )
+    .arg(Arg::new("OLD_ARRAYS")
+        .help("Force the use of old array notation (e.g. ._2_) even when the a2l version allows the use of new array notation (e.g. [2]).")
+        .long("old-arrays")
+        .number_of_values(0)
+        .action(clap::ArgAction::SetTrue)
     )
     .arg(Arg::new("A2LVERSION")
         .help("Convert the input file to the given version (e.g. \"1.5.1\", \"1.6.0\", etc.). This is a lossy operation, which deletes incompatible information.")
@@ -711,13 +902,27 @@ fn get_args() -> ArgMatches {
         .number_of_values(0)
         .action(clap::ArgAction::SetTrue)
     )
+    .arg(Arg::new("INSERT_A2ML")
+        .help("Insert an A2ML definition into the a2l file, if it does not already exist.")
+        .long("insert-a2ml")
+        .number_of_values(0)
+        .action(clap::ArgAction::SetTrue)
+    )
+    .arg(Arg::new("FROM_SOURCE")
+        .help("Create elements in the a2l file based on special comments in a source file. Argument can be a filename or pattern (e.g. *.c).")
+        .long("from-source")
+        .number_of_values(1)
+        .value_parser(ValueParser::os_string())
+        .value_name("SOURCE_FILE")
+        .action(clap::ArgAction::Append)
+    )
     .arg(Arg::new("INSERT_CHARACTERISTIC")
         .help("Insert a CHARACTERISTIC based on a variable in the elf file. The variable name can be complex, e.g. var.element[0].subelement")
         .short('C')
         .long("characteristic")
         .aliases(["insert-characteristic"])
         .number_of_values(1)
-        .requires("ELFFILE")
+        .requires("DEBUGINFO_ARGGROUP")
         .value_name("VAR")
         .action(clap::ArgAction::Append)
     )
@@ -746,8 +951,8 @@ fn get_args() -> ArgMatches {
         .long("characteristic-range")
         .aliases(["insert-characteristic-range"])
         .number_of_values(2)
-        .requires("ELFFILE")
-        .value_name("RANGE")
+        .requires("DEBUGINFO_ARGGROUP")
+        .value_name("ADDR")
         .value_parser(AddressValueParser)
         .action(clap::ArgAction::Append)
     )
@@ -756,7 +961,7 @@ fn get_args() -> ArgMatches {
         .long("characteristic-regex")
         .aliases(["insert-characteristic-regex"])
         .number_of_values(1)
-        .requires("ELFFILE")
+        .requires("DEBUGINFO_ARGGROUP")
         .value_name("REGEX")
         .action(clap::ArgAction::Append)
     )
@@ -765,7 +970,7 @@ fn get_args() -> ArgMatches {
         .long("characteristic-section")
         .aliases(["insert-characteristic-section"])
         .number_of_values(1)
-        .requires("ELFFILE")
+        .requires("DEBUGINFO_ARGGROUP")
         .value_name("SECTION")
         .action(clap::ArgAction::Append)
     )
@@ -775,7 +980,7 @@ fn get_args() -> ArgMatches {
         .long("measurement")
         .aliases(["insert-measurement"])
         .number_of_values(1)
-        .requires("ELFFILE")
+        .requires("DEBUGINFO_ARGGROUP")
         .value_name("VAR")
         .action(clap::ArgAction::Append)
     )
@@ -784,8 +989,8 @@ fn get_args() -> ArgMatches {
         .long("measurement-range")
         .aliases(["insert-measurement-range"])
         .number_of_values(2)
-        .requires("ELFFILE")
-        .value_name("RANGE")
+        .requires("DEBUGINFO_ARGGROUP")
+        .value_name("ADDR")
         .value_parser(AddressValueParser)
         .action(clap::ArgAction::Append)
     )
@@ -794,7 +999,7 @@ fn get_args() -> ArgMatches {
         .long("measurement-regex")
         .aliases(["insert-measurement-regex"])
         .number_of_values(1)
-        .requires("ELFFILE")
+        .requires("DEBUGINFO_ARGGROUP")
         .value_name("REGEX")
         .action(clap::ArgAction::Append)
     )
@@ -803,7 +1008,7 @@ fn get_args() -> ArgMatches {
         .long("measurement-section")
         .aliases(["insert-measurement-section"])
         .number_of_values(1)
-        .requires("ELFFILE")
+        .requires("DEBUGINFO_ARGGROUP")
         .value_name("SECTION")
         .action(clap::ArgAction::Append)
     )
@@ -814,15 +1019,36 @@ fn get_args() -> ArgMatches {
         .requires("INSERT_ARGGROUP")
         .value_name("GROUP")
     )
+    .arg(Arg::new("REMOVE_REGEX")
+        .help("Remove any CHARACTERISTICs, MEASUREMENTs, AXIS_PTS and INSTANCEs whose name matches the given regex.")
+        .short('R')
+        .long("remove")
+        .number_of_values(1)
+        .value_name("REGEX")
+        .action(clap::ArgAction::Append)
+    )
+    .arg(Arg::new("REMOVE_RANGE")
+        .help("Remove any CHARACTERISTICs, MEASUREMENTs, AXIS_PTS and INSTANCEs whose address is inside the given range.")
+        .long("remove-range")
+        .number_of_values(2)
+        .value_name("ADDR")
+        .value_parser(AddressValueParser)
+        .action(clap::ArgAction::Append)
+    )
+    .group(
+        ArgGroup::new("DEBUGINFO_ARGGROUP")
+            .args(["ELFFILE", "PDBFILE"])
+            .multiple(false)
+    )
     .group(
         ArgGroup::new("INPUT_ARGGROUP")
             .args(["INPUT", "CREATE"])
             .multiple(false)
             .required(true)
-     )
+    )
     .group(
         ArgGroup::new("UPDATE_ARGGROUP")
-            .args(["UPDATE", "SAFE_UPDATE"])
+            .args(["UPDATE_TYPE", "SAFE_UPDATE"])
             .multiple(false)
     )
     .group(
@@ -882,12 +1108,11 @@ impl clap::builder::TypedValueParser for AddressValueParser {
         arg: Option<&clap::Arg>,
         value: &std::ffi::OsStr,
     ) -> Result<Self::Value, clap::Error> {
-        if let Some(txt) = value.to_str() {
-            if let Some(hexval) = txt.strip_prefix("0x") {
-                if let Ok(value) = u64::from_str_radix(hexval, 16) {
-                    return Ok(value);
-                }
-            }
+        if let Some(txt) = value.to_str()
+            && let Some(hexval) = txt.strip_prefix("0x")
+            && let Ok(value) = u64::from_str_radix(hexval, 16)
+        {
+            return Ok(value);
         }
 
         let mut err = clap::Error::new(clap::error::ErrorKind::ValueValidation).with_cmd(cmd);
@@ -973,5 +1198,699 @@ impl Display for A2lVersion {
             A2lVersion::V1_7_0 => f.write_str("1.7.0"),
             A2lVersion::V1_7_1 => f.write_str("1.7.1"),
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct UpdateModeParser;
+
+impl clap::builder::TypedValueParser for UpdateModeParser {
+    type Value = UpdateMode;
+
+    fn parse_ref(
+        &self,
+        cmd: &clap::Command,
+        arg: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> Result<Self::Value, clap::Error> {
+        match value.to_string_lossy().to_uppercase().as_ref() {
+            "DEFAULT" => Ok(UpdateMode::Default),
+            "STRICT" => Ok(UpdateMode::Strict),
+            "PRESERVE" => Ok(UpdateMode::Preserve),
+            _ => {
+                let mut err =
+                    clap::Error::new(clap::error::ErrorKind::ValueValidation).with_cmd(cmd);
+                if let Some(arg) = arg {
+                    err.insert(
+                        clap::error::ContextKind::InvalidArg,
+                        clap::error::ContextValue::String(arg.to_string()),
+                    );
+                }
+                let strval = value.to_string_lossy();
+                err.insert(
+                    clap::error::ContextKind::InvalidValue,
+                    clap::error::ContextValue::String(String::from(strval)),
+                );
+                Err(err)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct UpdateTypeParser;
+
+impl clap::builder::TypedValueParser for UpdateTypeParser {
+    type Value = UpdateType;
+
+    fn parse_ref(
+        &self,
+        cmd: &clap::Command,
+        arg: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> Result<Self::Value, clap::Error> {
+        match value.to_string_lossy().to_uppercase().as_ref() {
+            "FULL" => Ok(UpdateType::Full),
+            "ADDRESSES" => Ok(UpdateType::Addresses),
+            _ => {
+                let mut err =
+                    clap::Error::new(clap::error::ErrorKind::ValueValidation).with_cmd(cmd);
+                if let Some(arg) = arg {
+                    err.insert(
+                        clap::error::ContextKind::InvalidArg,
+                        clap::error::ContextValue::String(arg.to_string()),
+                    );
+                }
+                let strval = value.to_string_lossy();
+                err.insert(
+                    clap::error::ContextKind::InvalidValue,
+                    clap::error::ContextValue::String(String::from(strval)),
+                );
+                Err(err)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct MergePrefParser;
+
+impl clap::builder::TypedValueParser for MergePrefParser {
+    type Value = MergePref;
+
+    fn parse_ref(
+        &self,
+        cmd: &clap::Command,
+        arg: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> Result<Self::Value, clap::Error> {
+        match value.to_string_lossy().to_uppercase().as_ref() {
+            "EXISTING" => Ok(MergePref::Existing),
+            "NEW" => Ok(MergePref::New),
+            "BOTH" => Ok(MergePref::Both),
+            "MERGE" => Ok(MergePref::Both), // alias for convenience
+            _ => {
+                let mut err =
+                    clap::Error::new(clap::error::ErrorKind::ValueValidation).with_cmd(cmd);
+                if let Some(arg) = arg {
+                    err.insert(
+                        clap::error::ContextKind::InvalidArg,
+                        clap::error::ContextValue::String(arg.to_string()),
+                    );
+                }
+                let strval = value.to_string_lossy();
+                err.insert(
+                    clap::error::ContextKind::InvalidValue,
+                    clap::error::ContextValue::String(String::from(strval)),
+                );
+                Err(err)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use a2lfile::A2lObjectName;
+
+    use super::*;
+
+    #[test]
+    fn test_option_create_output() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let outfile = tempdir.path().join("output.a2l");
+        assert!(!outfile.exists());
+        let args = vec![
+            OsString::from("a2ltool"),
+            OsString::from("--create"),
+            OsString::from("--output"),
+            OsString::from(outfile.clone()),
+        ];
+        let result = core(args.into_iter());
+        // Passing the option --create should neither panic nor return an error
+        // Passing the option --output should neither panic nor return an error
+        // After the run, the output file should exist
+        assert!(result.is_ok());
+        assert!(outfile.exists());
+        assert!(outfile.is_file());
+    }
+
+    #[test]
+    fn test_option_input() {
+        let args = vec![
+            OsString::from("a2ltool"),
+            OsString::from("fixtures/a2l/update_test1.a2l"),
+        ];
+        let result = core(args.into_iter());
+        // Passing the option --input should neither panic nor return an error
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_option_check() {
+        let args = vec![
+            OsString::from("a2ltool"),
+            OsString::from("fixtures/a2l/check_test.a2l"),
+            OsString::from("--check"),
+        ];
+        let result = core(args.into_iter());
+        // Passing the option --check should neither panic nor return an error
+        // check_test.a2l has problems, but without --strict they are only warnings
+        assert!(result.is_ok());
+
+        let args = vec![
+            OsString::from("a2ltool"),
+            OsString::from("fixtures/a2l/check_test.a2l"),
+            OsString::from("--check"),
+            OsString::from("--strict"),
+        ];
+        let result = core(args.into_iter());
+        // Passing the option --check should neither panic nor return an error
+        // check_test.a2l has problems, and with --strict they are errors
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_option_elffile() {
+        let args = vec![
+            OsString::from("a2ltool"),
+            OsString::from("--create"),
+            OsString::from("--elffile"),
+            OsString::from("fixtures/bin/update_test.elf"),
+        ];
+        // Passing the option --elffile should neither panic nor return an error
+        core(args.into_iter()).unwrap();
+    }
+
+    #[test]
+    fn test_option_cleanup() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let outfile = tempdir.path().join("output.a2l");
+        assert!(!outfile.exists());
+        let args = vec![
+            OsString::from("a2ltool"),
+            OsString::from("fixtures/a2l/cleanup_test.a2l"),
+            OsString::from("--cleanup"),
+            OsString::from("--output"),
+            OsString::from(outfile.clone()),
+        ];
+        // Passing the option --cleanup should neither panic nor return an error
+        // cleanup_test.a2l has unused items, but --cleanup should remove them
+        core(args.into_iter()).unwrap();
+
+        let (a2l_input, _) = a2lfile::load("fixtures/a2l/cleanup_test.a2l", None, false).unwrap();
+        let (a2l_output, _) = a2lfile::load(outfile, None, false).unwrap();
+        assert_ne!(a2l_input, a2l_output);
+        // all items in cleanup_test.a2l are used
+        assert!(a2l_output.project.module[0].record_layout.is_empty());
+        assert!(a2l_output.project.module[0].compu_method.is_empty());
+        assert!(a2l_output.project.module[0].group.is_empty());
+    }
+
+    #[test]
+    fn test_option_update() {
+        let tempdir = tempfile::tempdir().unwrap();
+
+        // 1. full update
+        let outfile = tempdir.path().join("output.a2l");
+        assert!(!outfile.exists());
+        let args = vec![
+            OsString::from("a2ltool"),
+            OsString::from("fixtures/a2l/update_test1.a2l"),
+            OsString::from("--elffile"),
+            OsString::from("fixtures/bin/update_test.elf"),
+            OsString::from("--update"),
+            OsString::from("FULL"),
+            OsString::from("-v"),
+            OsString::from("--output"),
+            OsString::from(outfile.clone()),
+        ];
+        // Passing the option --update should neither panic nor return an error
+        // update_test.elf has symbols that can be updated in the a2l file
+        core(args.into_iter()).unwrap();
+
+        let (a2l_output, _) = a2lfile::load(outfile, None, false).unwrap();
+        // the output file should have updated addresses
+        let module = &a2l_output.project.module[0];
+        assert_ne!(module.characteristic[0].address, 0);
+        assert_ne!(
+            module.measurement[0].ecu_address.as_ref().unwrap().address,
+            0
+        );
+
+        // 2. address update only in strict mode on valid input
+        let outfile = tempdir.path().join("output2.a2l");
+        assert!(!outfile.exists());
+        let args = vec![
+            OsString::from("a2ltool"),
+            OsString::from("fixtures/a2l/update_test1.a2l"),
+            OsString::from("--elffile"),
+            OsString::from("fixtures/bin/update_test.elf"),
+            OsString::from("--update"),
+            OsString::from("ADDRESSES"),
+            OsString::from("--update-mode"),
+            OsString::from("STRICT"),
+            OsString::from("-v"),
+            OsString::from("--output"),
+            OsString::from(outfile.clone()),
+        ];
+        core(args.into_iter()).unwrap();
+        let (a2l_output, _) = a2lfile::load(outfile, None, false).unwrap();
+        assert!(a2l_output.project.module[0].characteristic[0].address != 0);
+
+        // 3. address update only in strict mode on invalid input
+        let outfile = tempdir.path().join("output3.a2l");
+        assert!(!outfile.exists());
+        let args = vec![
+            OsString::from("a2ltool"),
+            OsString::from("fixtures/a2l/update_test2.a2l"),
+            OsString::from("--elffile"),
+            OsString::from("fixtures/bin/update_test_invalid.elf"),
+            OsString::from("--update"),
+            OsString::from("ADDRESSES"),
+            OsString::from("--update-mode"),
+            OsString::from("STRICT"),
+            OsString::from("-v"),
+            OsString::from("--output"),
+            OsString::from(outfile.clone()),
+        ];
+        let result = core(args.into_iter());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_option_insert() {
+        // characteristics and measurements can be inserted in several different ways:
+        // - by name with --characteristic and --measurement
+        // - by address range with --characteristic-range and --measurement-range
+        // - by regex with --characteristic-regex and --measurement-regex
+        // - by section with --characteristic-section and --measurement-section
+        // The option --target-group can be used to put the inserted items into a group, and is tested here too
+
+        // 1. insert by name
+        let tempdir = tempfile::tempdir().unwrap();
+        let outfile = tempdir.path().join("output1.a2l");
+        assert!(!outfile.exists());
+        let args = vec![
+            OsString::from("a2ltool"),
+            OsString::from("--create"),
+            OsString::from("--elffile"),
+            OsString::from("fixtures/bin/update_test.elf"),
+            OsString::from("--characteristic"),
+            OsString::from("Characteristic_Value"),
+            OsString::from("--measurement"),
+            OsString::from("Measurement_Value"),
+            OsString::from("--target-group"),
+            OsString::from("TestGroup"),
+            OsString::from("-v"),
+            OsString::from("--output"),
+            OsString::from(outfile.clone()),
+        ];
+        core(args.into_iter()).unwrap();
+        let (a2l_output, _) = a2lfile::load(outfile, None, false).unwrap();
+        assert_eq!(a2l_output.project.module[0].measurement.len(), 1);
+        assert_eq!(a2l_output.project.module[0].characteristic.len(), 1);
+        assert_eq!(a2l_output.project.module[0].group.len(), 1);
+        assert_eq!(
+            a2l_output.project.module[0].group[0].get_name(),
+            "TestGroup"
+        );
+        // get the addresses of the inserted items for the second test
+        let measurement_addr = a2l_output.project.module[0].measurement[0]
+            .ecu_address
+            .as_ref()
+            .unwrap()
+            .address;
+        let characteristic_addr = a2l_output.project.module[0].characteristic[0].address;
+
+        // 2. insert by address range
+        let outfile = tempdir.path().join("output2.a2l");
+        assert!(!outfile.exists());
+        let args = vec![
+            OsString::from("a2ltool"),
+            OsString::from("--create"),
+            OsString::from("--elffile"),
+            OsString::from("fixtures/bin/update_test.elf"),
+            OsString::from("--characteristic-range"),
+            OsString::from(format!("0x{:x}", characteristic_addr)),
+            OsString::from(format!("0x{:x}", characteristic_addr + 4)),
+            OsString::from("--measurement-range"),
+            OsString::from(format!("0x{:x}", measurement_addr)),
+            OsString::from(format!("0x{:x}", measurement_addr + 4)),
+            OsString::from("--output"),
+            OsString::from(outfile.clone()),
+        ];
+        core(args.into_iter()).unwrap();
+        let (a2l_output, _) = a2lfile::load(outfile, None, false).unwrap();
+        assert_eq!(a2l_output.project.module[0].measurement.len(), 1);
+        assert_eq!(a2l_output.project.module[0].characteristic.len(), 1);
+        assert_eq!(a2l_output.project.module[0].group.len(), 0); // no --target-group used this time
+
+        // 3. insert by regex
+        let outfile = tempdir.path().join("output3.a2l");
+        assert!(!outfile.exists());
+        let args = vec![
+            OsString::from("a2ltool"),
+            OsString::from("--create"),
+            OsString::from("--elffile"),
+            OsString::from("fixtures/bin/update_test.elf"),
+            OsString::from("--characteristic-regex"),
+            OsString::from("C.*Value"),
+            OsString::from("--measurement-regex"),
+            OsString::from("M.*Valu."),
+            OsString::from("--output"),
+            OsString::from(outfile.clone()),
+        ];
+        core(args.into_iter()).unwrap();
+        let (a2l_output, _) = a2lfile::load(outfile, None, false).unwrap();
+        assert_eq!(a2l_output.project.module[0].measurement.len(), 1);
+        assert_eq!(a2l_output.project.module[0].characteristic.len(), 1);
+
+        // 4. insert by section
+        let outfile = tempdir.path().join("output4.a2l");
+        assert!(!outfile.exists());
+        let args = vec![
+            OsString::from("a2ltool"),
+            OsString::from("--create"),
+            OsString::from("--elffile"),
+            OsString::from("fixtures/bin/update_test.elf"),
+            OsString::from("--characteristic-section"),
+            OsString::from(".data"),
+            OsString::from("--measurement-section"),
+            OsString::from(".bss"),
+            OsString::from("--output"),
+            OsString::from(outfile.clone()),
+        ];
+        let result = core(args.into_iter());
+        assert!(result.is_ok());
+        let (a2l_output, _) = a2lfile::load(outfile, None, false).unwrap();
+        assert!(!a2l_output.project.module[0].measurement.is_empty());
+        assert!(!a2l_output.project.module[0].characteristic.is_empty());
+    }
+
+    #[test]
+    fn test_option_merge() {
+        // merging can be done on the MODULE level with --merge and on the PROJECT level with --merge-project
+
+        // 1. merge on the MODULE level
+        let tempdir = tempfile::tempdir().unwrap();
+        let outfile = tempdir.path().join("output.a2l");
+        assert!(!outfile.exists());
+        let args = vec![
+            OsString::from("a2ltool"),
+            OsString::from("--create"),
+            OsString::from("--merge"),
+            OsString::from("fixtures/a2l/update_test1.a2l"),
+            OsString::from("--output"),
+            OsString::from(outfile.clone()),
+        ];
+        core(args.into_iter()).unwrap();
+        let (a2l_input, _) = a2lfile::load("fixtures/a2l/update_test1.a2l", None, false).unwrap();
+        let (a2l_output, _) = a2lfile::load(outfile, None, false).unwrap();
+        // there should be only one MODULE in the output
+        assert_eq!(a2l_output.project.module.len(), 1);
+        // the input file was merged with an empty file, so the output should be the same as the input
+        assert_eq!(
+            a2l_output.project.module[0].measurement.len(),
+            a2l_input.project.module[0].measurement.len()
+        );
+        assert_eq!(
+            a2l_output.project.module[0].characteristic.len(),
+            a2l_input.project.module[0].characteristic.len()
+        );
+        assert_eq!(
+            a2l_output.project.module[0].group.len(),
+            a2l_input.project.module[0].group.len()
+        );
+        assert_eq!(
+            a2l_output.project.module[0].record_layout.len(),
+            a2l_input.project.module[0].record_layout.len()
+        );
+        assert_eq!(
+            a2l_output.project.module[0].compu_method.len(),
+            a2l_input.project.module[0].compu_method.len()
+        );
+
+        // 2. merge on the PROJECT level
+        let outfile = tempdir.path().join("output2.a2l");
+        assert!(!outfile.exists());
+        let args = vec![
+            OsString::from("a2ltool"),
+            OsString::from("--create"),
+            OsString::from("--merge-project"),
+            OsString::from("fixtures/a2l/update_test1.a2l"),
+            OsString::from("--output"),
+            OsString::from(outfile.clone()),
+        ];
+        core(args.into_iter()).unwrap();
+        let (a2l_input, _) = a2lfile::load("fixtures/a2l/update_test1.a2l", None, false).unwrap();
+        let (a2l_output, _) = a2lfile::load(outfile, None, false).unwrap();
+        // there should be two MODULEs in the output
+        assert_eq!(a2l_output.project.module.len(), 2);
+        // one of the two MODULEs in the output should be the same as the input file
+        let output_module = a2l_output
+            .project
+            .module
+            .get(a2l_input.project.module[0].get_name())
+            .unwrap();
+        assert_eq!(output_module, &a2l_input.project.module[0]);
+    }
+
+    #[test]
+    fn test_option_merge_new() {
+        // when merging, the preference for existing or new items can be set with --merge-pref
+        let tempdir = tempfile::tempdir().unwrap();
+        let outfile = tempdir.path().join("output.a2l");
+        assert!(!outfile.exists());
+        let args = vec![
+            OsString::from("a2ltool"),
+            OsString::from("fixtures/a2l/update_test1.a2l"),
+            OsString::from("--merge"),
+            OsString::from("fixtures/a2l/update_test1.a2l"),
+            OsString::from("--merge-preference"),
+            OsString::from("NEW"),
+            OsString::from("--output"),
+            OsString::from(outfile.clone()),
+        ];
+        core(args.into_iter()).unwrap();
+        let (a2l_input, _) = a2lfile::load("fixtures/a2l/update_test1.a2l", None, false).unwrap();
+        let (a2l_output, _) = a2lfile::load(outfile, None, false).unwrap();
+        // merging a file with itself with preference for new items should leave the file unchanged
+        assert_eq!(a2l_input, a2l_output);
+    }
+
+    #[test]
+    fn test_option_merge_existing() {
+        // when merging, the preference for existing or new items can be set with --merge-pref
+        let tempdir = tempfile::tempdir().unwrap();
+        let outfile = tempdir.path().join("output.a2l");
+        assert!(!outfile.exists());
+        let args = vec![
+            OsString::from("a2ltool"),
+            OsString::from("fixtures/a2l/update_test1.a2l"),
+            OsString::from("--merge"),
+            OsString::from("fixtures/a2l/update_test1.a2l"),
+            OsString::from("--merge-preference"),
+            OsString::from("EXISTING"),
+            OsString::from("--output"),
+            OsString::from(outfile.clone()),
+        ];
+        core(args.into_iter()).unwrap();
+        let (a2l_input, _) = a2lfile::load("fixtures/a2l/update_test1.a2l", None, false).unwrap();
+        let (a2l_output, _) = a2lfile::load(outfile, None, false).unwrap();
+        // merging a file with itself with preference for existing items should leave the file unchanged
+        assert_eq!(a2l_input, a2l_output);
+    }
+
+    #[test]
+    fn test_option_remove() {
+        // items can be removed by name with --remove
+        let (a2l_input, _) = a2lfile::load("fixtures/a2l/update_test1.a2l", None, false).unwrap();
+        // get the names of the first characteristic and measurement, so they can be removed
+        let characteristic_name = a2l_input.project.module[0].characteristic[0]
+            .get_name()
+            .to_string();
+        let measurement_name = a2l_input.project.module[0].measurement[0]
+            .get_name()
+            .to_string();
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let outfile = tempdir.path().join("output.a2l");
+        assert!(!outfile.exists());
+        let args = vec![
+            OsString::from("a2ltool"),
+            OsString::from("fixtures/a2l/update_test1.a2l"),
+            OsString::from("--remove"),
+            OsString::from(characteristic_name),
+            OsString::from("--remove"),
+            OsString::from(measurement_name),
+            OsString::from("--output"),
+            OsString::from(outfile.clone()),
+        ];
+        core(args.into_iter()).unwrap();
+        let (a2l_output, _) = a2lfile::load(outfile, None, false).unwrap();
+        // the output should have one less characteristic and one less measurement than the input
+        assert_eq!(
+            a2l_input.project.module[0].characteristic.len(),
+            a2l_output.project.module[0].characteristic.len() + 1
+        );
+        assert_eq!(
+            a2l_input.project.module[0].measurement.len(),
+            a2l_output.project.module[0].measurement.len() + 1
+        );
+    }
+
+    #[test]
+    fn test_option_remove_range() {
+        // items can be removed by address range with --remove-range
+        let (a2l_input, _) = a2lfile::load("fixtures/a2l/remove_test.a2l", None, false).unwrap();
+        // get the address of the first characteristic and measurement, so they can be removed
+        let characteristic_addr = a2l_input.project.module[0].characteristic[0].address;
+        let measurement_addr = a2l_input.project.module[0].measurement[0]
+            .ecu_address
+            .as_ref()
+            .unwrap()
+            .address;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let outfile = tempdir.path().join("output.a2l");
+        assert!(!outfile.exists());
+        let args = vec![
+            OsString::from("a2ltool"),
+            OsString::from("fixtures/a2l/remove_test.a2l"),
+            OsString::from("--remove-range"),
+            OsString::from(format!("0x{:x}", characteristic_addr)),
+            OsString::from(format!("0x{:x}", characteristic_addr + 4)),
+            OsString::from("--remove-range"),
+            OsString::from(format!("0x{:x}", measurement_addr)),
+            OsString::from(format!("0x{:x}", measurement_addr + 4)),
+            OsString::from("--output"),
+            OsString::from(outfile.clone()),
+        ];
+        core(args.into_iter()).unwrap();
+        let (a2l_output, _) = a2lfile::load(outfile, None, false).unwrap();
+        // the output should have one less characteristic and one less measurement than the input
+        assert_eq!(
+            a2l_input.project.module[0].characteristic.len(),
+            a2l_output.project.module[0].characteristic.len() + 1
+        );
+        assert_eq!(
+            a2l_input.project.module[0].measurement.len(),
+            a2l_output.project.module[0].measurement.len() + 1
+        );
+    }
+
+    #[test]
+    fn test_option_a2lversion() {
+        // the a2l version can be set with --a2lversion
+        let tempdir = tempfile::tempdir().unwrap();
+        let outfile = tempdir.path().join("output.a2l");
+        assert!(!outfile.exists());
+        let args = vec![
+            OsString::from("a2ltool"),
+            OsString::from("--create"),
+            OsString::from("--a2lversion"),
+            OsString::from("1.6.0"),
+            OsString::from("--output"),
+            OsString::from(outfile.clone()),
+        ];
+        core(args.into_iter()).unwrap();
+        let (a2l_output, _) = a2lfile::load(outfile, None, false).unwrap();
+        assert_eq!(a2l_output.asap2_version.as_ref().unwrap().version_no, 1);
+        assert_eq!(a2l_output.asap2_version.as_ref().unwrap().upgrade_no, 60);
+
+        // modify the a2l version of an existing file
+        let outfile2 = tempdir.path().join("output2.a2l");
+        let args = vec![
+            OsString::from("a2ltool"),
+            OsString::from("fixtures/a2l/update_test1.a2l"),
+            OsString::from("--a2lversion"),
+            OsString::from("1.5.0"),
+            OsString::from("--output"),
+            OsString::from(outfile2.clone()),
+        ];
+        core(args.into_iter()).unwrap();
+        let (a2l_output, _) = a2lfile::load(outfile2, None, false).unwrap();
+        assert_eq!(a2l_output.asap2_version.as_ref().unwrap().version_no, 1);
+        assert_eq!(a2l_output.asap2_version.as_ref().unwrap().upgrade_no, 50);
+    }
+
+    #[test]
+    fn test_option_merge_includes() {
+        // the content of all included files can be merged with --merge-includes
+        let tempdir = tempfile::tempdir().unwrap();
+        let outfile = tempdir.path().join("output.a2l");
+        assert!(!outfile.exists());
+        let args = vec![
+            OsString::from("a2ltool"),
+            OsString::from("fixtures/a2l/merge_inc_test.a2l"),
+            OsString::from("--merge-includes"),
+            OsString::from("--output"),
+            OsString::from(outfile.clone()),
+        ];
+        core(args.into_iter()).unwrap();
+        let output_text = std::fs::read_to_string(outfile).unwrap();
+        // the output file should not contain any /include commands
+        assert!(!output_text.contains("/include"));
+    }
+
+    #[test]
+    fn test_option_sort() {
+        // all items in the file can be sorted with --sort
+        let tempdir = tempfile::tempdir().unwrap();
+        let outfile = tempdir.path().join("output.a2l");
+        assert!(!outfile.exists());
+        let args = vec![
+            OsString::from("a2ltool"),
+            OsString::from("fixtures/a2l/update_test1.a2l"),
+            OsString::from("--sort"),
+            OsString::from("--output"),
+            OsString::from(outfile.clone()),
+        ];
+        core(args.into_iter()).unwrap();
+        let (a2l_input, _) = a2lfile::load("fixtures/a2l/update_test1.a2l", None, false).unwrap();
+        let (a2l_output, _) = a2lfile::load(outfile, None, false).unwrap();
+
+        // Though sorting does not change the meaning of the file, the order of the items in the output is different.
+        // That means the files are not directly equal.
+        assert_ne!(a2l_input, a2l_output);
+        // Comparing the number of items is a reasonable approximation to show that the content remains the same.
+        assert_eq!(
+            a2l_input.project.module[0].measurement.len(),
+            a2l_output.project.module[0].measurement.len()
+        );
+        assert_eq!(
+            a2l_input.project.module[0].characteristic.len(),
+            a2l_output.project.module[0].characteristic.len()
+        );
+        assert_eq!(
+            a2l_input.project.module[0].group.len(),
+            a2l_output.project.module[0].group.len()
+        );
+        assert_eq!(
+            a2l_input.project.module[0].record_layout.len(),
+            a2l_output.project.module[0].record_layout.len()
+        );
+        assert_eq!(
+            a2l_input.project.module[0].compu_method.len(),
+            a2l_output.project.module[0].compu_method.len()
+        );
+        assert_eq!(
+            a2l_input.project.module[0].instance.len(),
+            a2l_output.project.module[0].instance.len()
+        );
+    }
+
+    #[test]
+    fn test_option_xcp() {
+        // the XCP settings in the file can be displayed with --show-xcp
+        let args = vec![
+            OsString::from("a2ltool"),
+            OsString::from("fixtures/a2l/xcp_test.a2l"),
+            OsString::from("--show-xcp"),
+        ];
+        // Passing the option --show-xcp should neither panic nor return an error
+        // The option only prints some information, so it is not possisble to check the output
+        core(args.into_iter()).unwrap();
     }
 }

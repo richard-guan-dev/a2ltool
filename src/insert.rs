@@ -1,20 +1,20 @@
 use a2lfile::{
-    A2lFile, A2lObject, AddrType, Characteristic, CharacteristicType, EcuAddress, FncValues, Group,
-    IndexMode, Instance, Measurement, Module, RecordLayout, RefCharacteristic, RefMeasurement,
-    Root, SymbolLink,
+    A2lFile, A2lObject, A2lObjectName, AddrType, Characteristic, CharacteristicType, EcuAddress,
+    FncValues, Group, IndexMode, Instance, Measurement, Module, RecordLayout, RefCharacteristic,
+    RefMeasurement, Root, SymbolLink,
 };
 use std::collections::HashMap;
 
+use crate::A2lVersion;
 use crate::datatype::{get_a2l_datatype, get_type_limits};
-use crate::dwarf::{DebugData, DwarfDataType, TypeInfo};
+use crate::debuginfo::{DbgDataType, DebugData, TypeInfo};
 use crate::symbol::SymbolInfo;
 use crate::update::{
     self, enums, make_symbol_link_string, set_address_type, set_bitmask, set_matrix_dim,
 };
-use crate::A2lVersion;
 use regex::Regex;
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 enum ItemType {
     Measurement(usize),
     Characteristic(usize),
@@ -31,7 +31,7 @@ struct InsertSupport<'a2l, 'dbg, 'param> {
     measurement_ranges: &'param [(u64, u64)],
     characteristic_ranges: &'param [(u64, u64)],
     name_map: HashMap<String, ItemType>,
-    sym_map: HashMap<String, ItemType>,
+    sym_map: HashMap<String, Vec<ItemType>>,
     characteristic_list: Vec<String>,
     measurement_list: Vec<String>,
     meas_count: u32,
@@ -54,7 +54,7 @@ pub(crate) fn insert_items(
 ) {
     let version = A2lVersion::from(&*a2l_file);
     let module = &mut a2l_file.project.module[0];
-    let (mut name_map, mut sym_map) = build_maps(&module);
+    let (mut name_map, mut sym_map) = build_maps(module);
     let mut characteristic_list = vec![];
     let mut measurement_list = vec![];
 
@@ -83,8 +83,7 @@ pub(crate) fn insert_items(
             || sym_info
                 .typeinfo
                 .get_arraytype()
-                .map(is_simple_type)
-                .unwrap_or(false)
+                .is_some_and(is_simple_type)
         {
             if is_calib {
                 match insert_characteristic_sym(
@@ -104,7 +103,7 @@ pub(crate) fn insert_items(
 
                         let it = ItemType::Characteristic(module.characteristic.len() - 1);
                         name_map.insert(characteristic_name, it);
-                        sym_map.insert(sym_name.to_string(), it);
+                        sym_map.entry(sym_name.to_string()).or_default().push(it);
                     }
                     Err(errmsg) => {
                         log_msgs.push(format!("Insert skipped: {errmsg}"));
@@ -120,7 +119,7 @@ pub(crate) fn insert_items(
 
                         let it = ItemType::Measurement(module.measurement.len() - 1);
                         name_map.insert(measure_name, it);
-                        sym_map.insert(sym_name.to_string(), it);
+                        sym_map.entry(sym_name.to_string()).or_default().push(it);
                     }
                     Err(errmsg) => {
                         log_msgs.push(format!("Insert skipped: {errmsg}"));
@@ -128,7 +127,7 @@ pub(crate) fn insert_items(
                 }
             }
         } else if enable_structures
-            && !matches!(sym_info.typeinfo.datatype, DwarfDataType::FuncPtr(_))
+            && !matches!(sym_info.typeinfo.datatype, DbgDataType::FuncPtr(_))
         {
             match insert_instance_sym(
                 module, debug_data, sym_name, &sym_info, &name_map, &sym_map, is_calib,
@@ -146,7 +145,7 @@ pub(crate) fn insert_items(
 
                     let it = ItemType::Instance(module.instance.len() - 1);
                     name_map.insert(instance_name, it);
-                    sym_map.insert(sym_name.to_string(), it);
+                    sym_map.entry(sym_name.to_string()).or_default().push(it);
                 }
                 Err(errmsg) => {
                     log_msgs.push(format!("Insert skipped: {errmsg}"));
@@ -172,7 +171,7 @@ fn insert_measurement_sym(
     debug_data: &DebugData,
     sym_info: &SymbolInfo,
     name_map: &HashMap<String, ItemType>,
-    sym_map: &HashMap<String, ItemType>,
+    sym_map: &HashMap<String, Vec<ItemType>>,
     version: A2lVersion,
 ) -> Result<String, String> {
     // Abort if a MEASUREMENT for this symbol already exists. Warn if any other reference to the symbol exists
@@ -193,7 +192,7 @@ fn insert_measurement_sym(
     );
     // create an ECU_ADDRESS attribute, and set it to hex display mode
     let mut ecu_address = EcuAddress::new(sym_info.address as u32);
-    ecu_address.get_layout_mut().item_location.0 .1 = true;
+    ecu_address.get_layout_mut().item_location.0.1 = true;
     new_measurement.ecu_address = Some(ecu_address);
 
     // create a SYMBOL_LINK attribute
@@ -206,8 +205,7 @@ fn insert_measurement_sym(
     let typeinfo = sym_info
         .typeinfo
         .get_pointer(&debug_data.types)
-        .map(|(_, t)| t)
-        .unwrap_or(sym_info.typeinfo);
+        .map_or(sym_info.typeinfo, |(_, t)| t);
 
     // handle arrays and unwrap the typeinfo
     update::set_matrix_dim(
@@ -217,12 +215,12 @@ fn insert_measurement_sym(
     );
     let typeinfo = typeinfo.get_arraytype().unwrap_or(typeinfo);
 
-    if let DwarfDataType::Enum { enumerators, .. } = &typeinfo.datatype {
+    if let DbgDataType::Enum { enumerators, .. } = &typeinfo.datatype {
         // create a conversion table for enums
         let enum_name = typeinfo
             .name
             .clone()
-            .unwrap_or_else(|| format!("{}_compu_method", new_measurement.name));
+            .unwrap_or_else(|| format!("{}_compu_method", new_measurement.get_name()));
         enums::cond_create_enum_conversion(module, &enum_name, enumerators);
         new_measurement.conversion = enum_name;
     } else {
@@ -239,7 +237,7 @@ fn insert_characteristic_sym(
     characteristic_sym: &str,
     sym_info: &SymbolInfo,
     name_map: &HashMap<String, ItemType>,
-    sym_map: &HashMap<String, ItemType>,
+    sym_map: &HashMap<String, Vec<ItemType>>,
     version: A2lVersion,
     lower_value: Option<f64>,
     upper_value: Option<f64>,
@@ -282,7 +280,7 @@ fn insert_characteristic_sym(
 
     set_bitmask(&mut new_characteristic.bit_mask, typeinfo);
 
-    if let DwarfDataType::Enum { enumerators, .. } = &typeinfo.datatype {
+    if let DbgDataType::Enum { enumerators, .. } = &typeinfo.datatype {
         let enum_name = typeinfo
             .name
             .clone()
@@ -292,7 +290,7 @@ fn insert_characteristic_sym(
     }
 
     // enable hex mode for the address (item 3 in the CHARACTERISTIC)
-    new_characteristic.get_layout_mut().item_location.3 .1 = true;
+    new_characteristic.get_layout_mut().item_location.3.1 = true;
 
     if version >= A2lVersion::V1_6_0 {
         // create a SYMBOL_LINK
@@ -304,7 +302,7 @@ fn insert_characteristic_sym(
 
     // create a RECORD_LAYOUT for the CHARACTERISTIC if it doesn't exist yet
     // the used naming convention (__<type>_Z) matches default naming used by Vector tools
-    let mut recordlayout = RecordLayout::new(recordlayout_name.clone());
+    let mut recordlayout = RecordLayout::new(recordlayout_name);
     // set item 0 (name) to use an offset of 0 lines, i.e. no line break after /begin RECORD_LAYOUT
     recordlayout.get_layout_mut().item_location.0 = 0;
     recordlayout.fnc_values = Some(FncValues::new(
@@ -314,11 +312,7 @@ fn insert_characteristic_sym(
         AddrType::Direct,
     ));
     // search through all existing record layouts and only add the new one if it doesn't exist yet
-    if !module
-        .record_layout
-        .iter()
-        .any(|rl| rl.name == recordlayout_name)
-    {
+    if !module.record_layout.contains_key(recordlayout.get_name()) {
         module.record_layout.push(recordlayout);
     }
 
@@ -327,7 +321,7 @@ fn insert_characteristic_sym(
 
 fn make_unique_measurement_name(
     module: &Module,
-    sym_map: &HashMap<String, ItemType>,
+    sym_map: &HashMap<String, Vec<ItemType>>,
     measure_sym: &str,
     name_map: &HashMap<String, ItemType>,
 ) -> Result<String, String> {
@@ -337,19 +331,24 @@ fn make_unique_measurement_name(
 
     // If an object of a different type already has this name, add the prefix "CHARACTERISTIC."
     let item_name = match sym_map.get(&cleaned_sym) {
-        Some(ItemType::Measurement(idx)) => {
-            return Err(format!(
-                "MEASUREMENT {} already references symbol {}.",
-                module.measurement[*idx].name, measure_sym
-            ))
-        }
-        Some(
-            ItemType::Characteristic(_)
-            | ItemType::Instance(_)
-            | ItemType::Blob
-            | ItemType::AxisPts,
-        ) => {
-            format!("MEASUREMENT.{cleaned_sym}")
+        Some(item_vec) => {
+            if let Some(ItemType::Measurement(idx)) = item_vec
+                .iter()
+                .find(|it| matches!(it, ItemType::Measurement(_)))
+            {
+                // there is already a MEASUREMENT for this symbol, and we don't want to create duplicates
+                return Err(format!(
+                    "MEASUREMENT {} already references symbol {measure_sym}.",
+                    module.measurement[*idx].get_name()
+                ));
+            } else {
+                // there is another object for this symbol
+                if name_map.get(&cleaned_sym).is_some() {
+                    format!("MEASUREMENT.{cleaned_sym}")
+                } else {
+                    cleaned_sym
+                }
+            }
         }
         None => cleaned_sym,
     };
@@ -362,7 +361,7 @@ fn make_unique_measurement_name(
 
 fn make_unique_characteristic_name(
     module: &Module,
-    sym_map: &HashMap<String, ItemType>,
+    sym_map: &HashMap<String, Vec<ItemType>>,
     characteristic_sym: &str,
     name_map: &HashMap<String, ItemType>,
 ) -> Result<String, String> {
@@ -372,16 +371,24 @@ fn make_unique_characteristic_name(
 
     // If an object of a different type already has this name, add the prefix "CHARACTERISTIC."
     let item_name = match sym_map.get(&cleaned_sym) {
-        Some(ItemType::Characteristic(idx)) => {
-            return Err(format!(
-                "CHARACTERISTIC {} already references symbol {}.",
-                module.characteristic[*idx].name, characteristic_sym
-            ))
-        }
-        Some(
-            ItemType::Measurement(_) | ItemType::Instance(_) | ItemType::Blob | ItemType::AxisPts,
-        ) => {
-            format!("CHARACTERISTIC.{cleaned_sym}")
+        Some(item_vec) => {
+            if let Some(ItemType::Characteristic(idx)) = item_vec
+                .iter()
+                .find(|it| matches!(it, ItemType::Characteristic(_)))
+            {
+                // there is already a CHARACTERISTIC for this symbol, and we don't want to create duplicates
+                return Err(format!(
+                    "CHARACTERISTIC {} already references symbol {characteristic_sym}.",
+                    module.characteristic[*idx].get_name()
+                ));
+            } else {
+                // there is another object for this symbol
+                if name_map.get(&cleaned_sym).is_some() {
+                    format!("CHARACTERISTIC.{cleaned_sym}")
+                } else {
+                    cleaned_sym
+                }
+            }
         }
         None => cleaned_sym,
     };
@@ -394,7 +401,7 @@ fn make_unique_characteristic_name(
 
 fn make_unique_instance_name(
     module: &Module,
-    sym_map: &HashMap<String, ItemType>,
+    sym_map: &HashMap<String, Vec<ItemType>>,
     instance_sym: &str,
     name_map: &HashMap<String, ItemType>,
 ) -> Result<String, String> {
@@ -404,19 +411,24 @@ fn make_unique_instance_name(
 
     // If an object of a different type already has this name, add the prefix "INSTANCE."
     let item_name = match sym_map.get(&cleaned_sym) {
-        Some(ItemType::Instance(idx)) => {
-            return Err(format!(
-                "INSTANCE {} already references symbol {}.",
-                module.instance[*idx].name, instance_sym
-            ))
-        }
-        Some(
-            ItemType::Measurement(_)
-            | ItemType::Characteristic(_)
-            | ItemType::Blob
-            | ItemType::AxisPts,
-        ) => {
-            format!("INSTANCE.{cleaned_sym}")
+        Some(item_vec) => {
+            if let Some(ItemType::Instance(idx)) = item_vec
+                .iter()
+                .find(|it| matches!(it, ItemType::Instance(_)))
+            {
+                // there is already an INSTANCE for this symbol, and we don't want to create duplicates
+                return Err(format!(
+                    "INSTANCE {} already references symbol {instance_sym}.",
+                    module.instance[*idx].get_name()
+                ));
+            } else {
+                // there is another object for this symbol
+                if name_map.get(&cleaned_sym).is_some() {
+                    format!("INSTANCE.{cleaned_sym}")
+                } else {
+                    cleaned_sym
+                }
+            }
         }
         None => cleaned_sym,
     };
@@ -427,37 +439,52 @@ fn make_unique_instance_name(
     Ok(item_name)
 }
 
-fn build_maps(module: &&mut Module) -> (HashMap<String, ItemType>, HashMap<String, ItemType>) {
+fn build_maps(module: &Module) -> (HashMap<String, ItemType>, HashMap<String, Vec<ItemType>>) {
     let mut name_map = HashMap::<String, ItemType>::new();
-    let mut sym_map = HashMap::<String, ItemType>::new();
+    let mut sym_map = HashMap::<String, Vec<ItemType>>::new();
     for (idx, chr) in module.characteristic.iter().enumerate() {
-        name_map.insert(chr.name.clone(), ItemType::Characteristic(idx));
+        name_map.insert(chr.get_name().to_string(), ItemType::Characteristic(idx));
         if let Some(sym_link) = &chr.symbol_link {
-            sym_map.insert(sym_link.symbol_name.clone(), ItemType::Characteristic(idx));
+            sym_map
+                .entry(sym_link.symbol_name.clone())
+                .or_default()
+                .push(ItemType::Characteristic(idx));
         }
     }
     for (idx, meas) in module.measurement.iter().enumerate() {
-        name_map.insert(meas.name.clone(), ItemType::Measurement(idx));
+        name_map.insert(meas.get_name().to_string(), ItemType::Measurement(idx));
         if let Some(sym_link) = &meas.symbol_link {
-            sym_map.insert(sym_link.symbol_name.clone(), ItemType::Measurement(idx));
+            sym_map
+                .entry(sym_link.symbol_name.clone())
+                .or_default()
+                .push(ItemType::Measurement(idx));
         }
     }
     for (idx, inst) in module.instance.iter().enumerate() {
-        name_map.insert(inst.name.clone(), ItemType::Instance(idx));
+        name_map.insert(inst.get_name().to_string(), ItemType::Instance(idx));
         if let Some(sym_link) = &inst.symbol_link {
-            sym_map.insert(sym_link.symbol_name.clone(), ItemType::Instance(idx));
+            sym_map
+                .entry(sym_link.symbol_name.clone())
+                .or_default()
+                .push(ItemType::Instance(idx));
         }
     }
     for blob in &module.blob {
-        name_map.insert(blob.name.clone(), ItemType::Blob);
+        name_map.insert(blob.get_name().to_string(), ItemType::Blob);
         if let Some(sym_link) = &blob.symbol_link {
-            sym_map.insert(sym_link.symbol_name.clone(), ItemType::Blob);
+            sym_map
+                .entry(sym_link.symbol_name.clone())
+                .or_default()
+                .push(ItemType::Blob);
         }
     }
     for axis_pts in &module.axis_pts {
-        name_map.insert(axis_pts.name.clone(), ItemType::AxisPts);
+        name_map.insert(axis_pts.get_name().to_string(), ItemType::AxisPts);
         if let Some(sym_link) = &axis_pts.symbol_link {
-            sym_map.insert(sym_link.symbol_name.clone(), ItemType::AxisPts);
+            sym_map
+                .entry(sym_link.symbol_name.clone())
+                .or_default()
+                .push(ItemType::AxisPts);
         }
     }
 
@@ -475,11 +502,12 @@ pub(crate) fn insert_many<'param>(
     target_group: Option<&str>,
     log_msgs: &mut Vec<String>,
     enable_structures: bool,
+    force_old_arrays: bool,
 ) {
     let file_version = crate::A2lVersion::from(&*a2l_file);
-    let use_new_arrays = file_version >= A2lVersion::V1_7_0;
+    let use_new_arrays = !force_old_arrays && file_version >= A2lVersion::V1_7_0;
     let module = &mut a2l_file.project.module[0];
-    let (name_map, sym_map) = build_maps(&module);
+    let (name_map, sym_map) = build_maps(module);
     let mut isupp = InsertSupport {
         module,
         debug_data: debugdata,
@@ -499,13 +527,25 @@ pub(crate) fn insert_many<'param>(
     };
     // compile the regular expressions
     for expr in measurement_regexes {
-        match Regex::new(expr) {
+        // extend the regex to match only the whole string, not just a substring
+        let extended_regex = if !expr.starts_with('^') && !expr.ends_with('$') {
+            format!("^{expr}$")
+        } else {
+            expr.to_string()
+        };
+        match Regex::new(&extended_regex) {
             Ok(compiled_re) => isupp.compiled_meas_re.push(compiled_re),
             Err(error) => println!("Invalid regex \"{expr}\": {error}"),
         }
     }
     for expr in characteristic_regexes {
-        match Regex::new(expr) {
+        // extend the regex to match only the whole string, not just a substring
+        let extended_regex = if !expr.starts_with('^') && !expr.ends_with('$') {
+            format!("^{expr}$")
+        } else {
+            expr.to_string()
+        };
+        match Regex::new(&extended_regex) {
             Ok(compiled_re) => isupp.compiled_char_re.push(compiled_re),
             Err(error) => println!("Invalid regex \"{expr}\": {error}"),
         }
@@ -516,17 +556,17 @@ pub(crate) fn insert_many<'param>(
     while let Some(sym_info) = current_item {
         let mut skip_children = false;
         match &sym_info.typeinfo.datatype {
-            DwarfDataType::TypeRef(_, _) | DwarfDataType::FuncPtr(_) => {}
-            DwarfDataType::Other(_)
-            | DwarfDataType::Pointer(_, _)
-            | DwarfDataType::Struct { .. }
-            | DwarfDataType::Class { .. }
-            | DwarfDataType::Union { .. } => {
+            DbgDataType::TypeRef(_, _) | DbgDataType::FuncPtr(_) => {}
+            DbgDataType::Other(_)
+            | DbgDataType::Pointer(_, _)
+            | DbgDataType::Struct { .. }
+            | DbgDataType::Class { .. }
+            | DbgDataType::Union { .. } => {
                 if enable_structures && check_and_insert_instance(&mut isupp, &sym_info, log_msgs) {
                     skip_children = true;
                 }
             }
-            DwarfDataType::Array { arraytype, .. } => {
+            DbgDataType::Array { arraytype, .. } => {
                 if is_simple_type(arraytype) {
                     if check_and_insert_simple_type(&mut isupp, &sym_info, log_msgs) {
                         skip_children = true;
@@ -537,18 +577,18 @@ pub(crate) fn insert_many<'param>(
                     skip_children = true;
                 }
             }
-            DwarfDataType::Enum { .. }
-            | DwarfDataType::Float
-            | DwarfDataType::Double
-            | DwarfDataType::Sint8
-            | DwarfDataType::Sint16
-            | DwarfDataType::Sint32
-            | DwarfDataType::Sint64
-            | DwarfDataType::Uint8
-            | DwarfDataType::Uint16
-            | DwarfDataType::Uint32
-            | DwarfDataType::Uint64
-            | DwarfDataType::Bitfield { .. } => {
+            DbgDataType::Enum { .. }
+            | DbgDataType::Float
+            | DbgDataType::Double
+            | DbgDataType::Sint8
+            | DbgDataType::Sint16
+            | DbgDataType::Sint32
+            | DbgDataType::Sint64
+            | DbgDataType::Uint8
+            | DbgDataType::Uint16
+            | DbgDataType::Uint32
+            | DbgDataType::Uint64
+            | DbgDataType::Bitfield { .. } => {
                 check_and_insert_simple_type(&mut isupp, &sym_info, log_msgs);
                 skip_children = true;
             }
@@ -590,17 +630,17 @@ pub(crate) fn insert_many<'param>(
 fn is_simple_type(typeinfo: &TypeInfo) -> bool {
     matches!(
         &typeinfo.datatype,
-        DwarfDataType::Enum { .. }
-            | DwarfDataType::Float
-            | DwarfDataType::Double
-            | DwarfDataType::Sint8
-            | DwarfDataType::Sint16
-            | DwarfDataType::Sint32
-            | DwarfDataType::Sint64
-            | DwarfDataType::Uint8
-            | DwarfDataType::Uint16
-            | DwarfDataType::Uint32
-            | DwarfDataType::Uint64
+        DbgDataType::Enum { .. }
+            | DbgDataType::Float
+            | DbgDataType::Double
+            | DbgDataType::Sint8
+            | DbgDataType::Sint16
+            | DbgDataType::Sint32
+            | DbgDataType::Sint64
+            | DbgDataType::Uint8
+            | DbgDataType::Uint16
+            | DbgDataType::Uint32
+            | DbgDataType::Uint64
     )
 }
 
@@ -637,7 +677,11 @@ fn check_and_insert_simple_type(
                 // update mappings to prevent the creation of duplicates
                 let it = ItemType::Measurement(isupp.module.measurement.len() - 1);
                 isupp.name_map.insert(measurement_name, it);
-                isupp.sym_map.insert(sym_info.name.clone(), it);
+                isupp
+                    .sym_map
+                    .entry(sym_info.name.clone())
+                    .or_default()
+                    .push(it);
 
                 any_inserted = true;
             }
@@ -676,7 +720,11 @@ fn check_and_insert_simple_type(
                 // update mappings to prevent the creation of duplicates
                 let it = ItemType::Characteristic(isupp.module.characteristic.len() - 1);
                 isupp.name_map.insert(characteristic_name, it);
-                isupp.sym_map.insert(sym_info.name.clone(), it);
+                isupp
+                    .sym_map
+                    .entry(sym_info.name.clone())
+                    .or_default()
+                    .push(it);
 
                 any_inserted = true;
             }
@@ -723,7 +771,11 @@ fn check_and_insert_instance<'dbg>(
                 // update mappings to prevent the creation of duplicates
                 let it = ItemType::Instance(isupp.module.instance.len() - 1);
                 isupp.name_map.insert(instance_name, it);
-                isupp.sym_map.insert(sym_info.name.clone(), it);
+                isupp
+                    .sym_map
+                    .entry(sym_info.name.clone())
+                    .or_default()
+                    .push(it);
 
                 isupp
                     .create_typedef
@@ -763,7 +815,11 @@ fn check_and_insert_instance<'dbg>(
                 // update mappings to prevent the creation of duplicates
                 let it = ItemType::Instance(isupp.module.instance.len() - 1);
                 isupp.name_map.insert(instance_name, it);
-                isupp.sym_map.insert(sym_info.name.clone(), it);
+                isupp
+                    .sym_map
+                    .entry(sym_info.name.clone())
+                    .or_default()
+                    .push(it);
 
                 isupp
                     .create_typedef
@@ -802,7 +858,7 @@ fn create_or_update_group(
     measurement_list: Vec<String>,
 ) {
     // try to find an existing group with the given name
-    let existing_group = module.group.iter_mut().find(|grp| grp.name == group_name);
+    let existing_group = module.group.get_mut(group_name);
 
     let group: &mut Group = if let Some(grp) = existing_group {
         grp
@@ -847,10 +903,10 @@ fn insert_instance_sym<'dbg>(
     instance_sym: &str,
     sym_info: &SymbolInfo<'dbg>,
     name_map: &HashMap<String, ItemType>,
-    sym_map: &HashMap<String, ItemType>,
+    sym_map: &HashMap<String, Vec<ItemType>>,
     is_calib: bool,
 ) -> Result<(String, &'dbg TypeInfo), String> {
-    if !matches!(&sym_info.typeinfo.datatype, DwarfDataType::FuncPtr(_)) {
+    if !matches!(&sym_info.typeinfo.datatype, DbgDataType::FuncPtr(_)) {
         // Abort if a INSTANCE for this symbol already exists. Warn if any other reference to the symbol exists
         let item_name = make_unique_instance_name(module, sym_map, &sym_info.name, name_map)?;
 
@@ -892,5 +948,452 @@ fn insert_instance_sym<'dbg>(
             "Cannot create an INSTANCE for {instance_sym} with unsuitable type {}",
             sym_info.typeinfo
         ))
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use std::ffi::OsString;
+
+    #[test]
+    fn test_is_insert_requested() {
+        let addr_ranges = [(0x1000, 0x2000), (0x3000, 0x4000)];
+        let name_regexes = vec![Regex::new(r"^foo$").unwrap(), Regex::new(r"^bar$").unwrap()];
+
+        // address is in range, name is not matched
+        assert!(is_insert_requested(
+            0x1500,
+            "baz",
+            &addr_ranges,
+            &name_regexes
+        ));
+        // address is not in range, name is matched
+        assert!(is_insert_requested(
+            0x2500,
+            "foo",
+            &addr_ranges,
+            &name_regexes
+        ));
+        // address is in range, name is matched
+        assert!(is_insert_requested(
+            0x3500,
+            "bar",
+            &addr_ranges,
+            &name_regexes
+        ));
+        // address is not in range, name is not matched
+        assert!(!is_insert_requested(
+            0x4500,
+            "qux",
+            &addr_ranges,
+            &name_regexes
+        ));
+    }
+
+    #[test]
+    fn test_insert_items_normal() {
+        let mut a2l = a2lfile::new();
+        let debug_data = crate::debuginfo::DebugData::load_dwarf(
+            &OsString::from("fixtures/bin/update_test.elf"),
+            false,
+        )
+        .unwrap();
+
+        // insert some MEASUREMENTs and CHARACTERISTICs
+        let measurement_symbols = vec!["Measurement_Value", "Measurement_Matrix"];
+        let characteristic_symbols = vec!["Characteristic_Value", "Characteristic_ValBlk"];
+        let target_group = Some("TestGroup");
+        let mut log_msgs = Vec::new();
+        insert_items(
+            &mut a2l,
+            &debug_data,
+            measurement_symbols,
+            characteristic_symbols,
+            target_group,
+            &mut log_msgs,
+            false,
+        );
+        assert_eq!(a2l.project.module[0].measurement.len(), 2);
+        assert_eq!(a2l.project.module[0].characteristic.len(), 2);
+
+        // insert some more MEASUREMENTs and CHARACTERISTICs, with conflicting names
+        // here the MEASUREMENTS conflict with the existing CHARACTERISTICs and vice versa
+        // the new items should be added with a prefix
+        let measurement_symbols = vec!["Characteristic_Value", "Characteristic_ValBlk"];
+        let characteristic_symbols = vec!["Measurement_Value", "Measurement_Matrix"];
+        let target_group = Some("TestGroup");
+        let mut log_msgs = Vec::new();
+        insert_items(
+            &mut a2l,
+            &debug_data,
+            measurement_symbols,
+            characteristic_symbols,
+            target_group,
+            &mut log_msgs,
+            false,
+        );
+        // verify that the new items were added with a prefix
+        assert_eq!(a2l.project.module[0].measurement.len(), 4);
+        assert!(
+            a2l.project.module[0]
+                .measurement
+                .contains_key("MEASUREMENT.Characteristic_Value")
+        );
+        assert_eq!(a2l.project.module[0].characteristic.len(), 4);
+        assert!(
+            a2l.project.module[0]
+                .characteristic
+                .contains_key("CHARACTERISTIC.Measurement_Value")
+        );
+
+        // insert some more MEASUREMENTs and CHARACTERISTICs, with conflicting names
+        // conflicting items of the same type are not added
+        let measurement_symbols = vec!["Measurement_Value", "Measurement_Matrix"];
+        let characteristic_symbols = vec!["Characteristic_Value", "Characteristic_ValBlk"];
+        let target_group = None;
+        let mut log_msgs = Vec::new();
+        insert_items(
+            &mut a2l,
+            &debug_data,
+            measurement_symbols,
+            characteristic_symbols,
+            target_group,
+            &mut log_msgs,
+            false,
+        );
+        for msg in log_msgs {
+            println!("{}", msg);
+        }
+        // the number of items is unchanged
+        assert_eq!(a2l.project.module[0].measurement.len(), 4);
+        assert_eq!(a2l.project.module[0].characteristic.len(), 4);
+    }
+
+    #[test]
+    fn test_insert_items_nonexistent() {
+        let mut a2l = a2lfile::new();
+        let debug_data = crate::debuginfo::DebugData::load_dwarf(
+            &OsString::from("fixtures/bin/update_test.elf"),
+            false,
+        )
+        .unwrap();
+
+        // adding non-existing items does nothing
+        let measurement_symbols = vec!["Nonexistent_Measurement"];
+        let characteristic_symbols = vec!["Nonexistent_Characteristic"];
+        let target_group = None;
+        let mut log_msgs = Vec::new();
+        insert_items(
+            &mut a2l,
+            &debug_data,
+            measurement_symbols,
+            characteristic_symbols,
+            target_group,
+            &mut log_msgs,
+            false,
+        );
+        // nothing was added
+        assert_eq!(a2l.project.module[0].measurement.len(), 0);
+        assert_eq!(a2l.project.module[0].characteristic.len(), 0);
+
+        // same in enable structures mode
+        let measurement_symbols = vec!["Nonexistent_Measurement"];
+        let characteristic_symbols = vec!["Nonexistent_Characteristic"];
+        let target_group = None;
+        let mut log_msgs = Vec::new();
+        insert_items(
+            &mut a2l,
+            &debug_data,
+            measurement_symbols,
+            characteristic_symbols,
+            target_group,
+            &mut log_msgs,
+            true,
+        );
+        // nothing was added
+        assert_eq!(a2l.project.module[0].measurement.len(), 0);
+        assert_eq!(a2l.project.module[0].characteristic.len(), 0);
+    }
+
+    #[test]
+    fn test_insert_items_structures() {
+        let mut a2l = a2lfile::new();
+        let debug_data = crate::debuginfo::DebugData::load_dwarf(
+            &OsString::from("fixtures/bin/update_test.elf"),
+            false,
+        )
+        .unwrap();
+
+        // insert items. The basic types are inserted as MEASUREMENTs and CHARACTERISTICs, the complex types are inserted as INSTANCEs
+        let measurement_symbols = vec![
+            "Characteristic_Value",
+            "Characteristic_ValBlk",
+            "Curve_InternalAxis",
+        ];
+        let characteristic_symbols = vec![
+            "Measurement_Value",
+            "Measurement_Matrix",
+            "Map_InternalAxis",
+        ];
+        let target_group = Some("TestGroup");
+        let mut log_msgs = Vec::new();
+        insert_items(
+            &mut a2l,
+            &debug_data,
+            measurement_symbols,
+            characteristic_symbols,
+            target_group,
+            &mut log_msgs,
+            true,
+        );
+        // the basic types are inserted as MEASUREMENTs and CHARACTERISTICs as in the previous test
+        assert_eq!(a2l.project.module[0].measurement.len(), 2);
+        assert_eq!(a2l.project.module[0].characteristic.len(), 2);
+        // Curve_InternalAxis and Map_InternalAxis are inserted as INSTANCEs, because they are structs
+        assert_eq!(a2l.project.module[0].instance.len(), 2);
+        assert!(
+            a2l.project.module[0]
+                .instance
+                .contains_key("Curve_InternalAxis")
+        );
+        assert!(
+            a2l.project.module[0]
+                .instance
+                .contains_key("Map_InternalAxis")
+        );
+        assert_eq!(a2l.project.module[0].typedef_structure.len(), 2);
+    }
+
+    #[test]
+    fn test_insert_multiple_normal() {
+        let mut a2l = a2lfile::new();
+        let debug_data = crate::debuginfo::DebugData::load_dwarf(
+            &OsString::from("fixtures/bin/update_test.elf"),
+            false,
+        )
+        .unwrap();
+
+        // insert MEASUREMENTs and CHARACTERISTICs for multiple symbols, using regexes
+        let measurement_ranges = &[];
+        let characteristic_ranges = &[];
+        let measurement_regexes = vec![r"^Measurement_.*$", r"^Curve_.*$"];
+        let characteristic_regexes = vec![r"^Characteristic_.*$", r"^Map_.*$"];
+        let target_group = Some("TestGroup");
+        let mut log_msgs = Vec::new();
+        insert_many(
+            &mut a2l,
+            &debug_data,
+            measurement_ranges,
+            characteristic_ranges,
+            measurement_regexes,
+            characteristic_regexes,
+            target_group,
+            &mut log_msgs,
+            false,
+            false,
+        );
+        // ^Measurement_.*$ expands to:
+        //   Measurement_Matrix, Measurement_Value, Measurement_Bitfield.bits_1, Measurement_Bitfield.bits_2, Measurement_Bitfield.bits_3
+        // ^Curve_.*$ expands to Curve_InternalAxis.x, Curve_InternalAxis.value, Curve_ExternalAxis.value
+        assert_eq!(a2l.project.module[0].measurement.len(), 8);
+        // ^Characteristic_.*$ expands to:
+        //   Characteristic_ValBlk, Characteristic_Value
+        // ^Map_.*$ expands to Map_InternalAxis.x, Map_InternalAxis.y, Map_InternalAxis.value, Map_ExternalAxis.value
+        assert_eq!(a2l.project.module[0].characteristic.len(), 6);
+
+        // insert MEASUREMENTs and CHARACTERISTICs for all symbols, using ranges, with conflicting names
+        let measurement_ranges = &[(0x1000, 0x10000)];
+        let characteristic_ranges = &[(0x1000, 0x10000)];
+        let measurement_regexes = vec![];
+        let characteristic_regexes = vec![];
+        let target_group = Some("TestGroup");
+        let mut log_msgs = Vec::new();
+        insert_many(
+            &mut a2l,
+            &debug_data,
+            measurement_ranges,
+            characteristic_ranges,
+            measurement_regexes,
+            characteristic_regexes,
+            target_group,
+            &mut log_msgs,
+            false,
+            false,
+        );
+        assert!(a2l.project.module[0].measurement.len() > 8);
+        assert!(a2l.project.module[0].characteristic.len() > 6);
+        assert!(
+            a2l.project.module[0]
+                .measurement
+                .contains_key("MEASUREMENT.Characteristic_Value")
+        );
+        assert!(
+            a2l.project.module[0]
+                .characteristic
+                .contains_key("CHARACTERISTIC.Measurement_Value")
+        );
+    }
+
+    #[test]
+    fn test_insert_multiple_structures() {
+        let mut a2l = a2lfile::new();
+        let debug_data = crate::debuginfo::DebugData::load_dwarf(
+            &OsString::from("fixtures/bin/update_test.elf"),
+            false,
+        )
+        .unwrap();
+
+        // insert MEASUREMENTs and CHARACTERISTICs for multiple symbols, using regexes
+        let measurement_ranges = &[];
+        let characteristic_ranges = &[];
+        let measurement_regexes = vec![r"^Measurement_.*$", r"^Curve_.*$"];
+        let characteristic_regexes = vec![r"^Characteristic_.*$", r"^Map_.*$"];
+        let target_group = Some("TestGroup");
+        let mut log_msgs = Vec::new();
+        insert_many(
+            &mut a2l,
+            &debug_data,
+            measurement_ranges,
+            characteristic_ranges,
+            measurement_regexes,
+            characteristic_regexes,
+            target_group,
+            &mut log_msgs,
+            true,
+            false,
+        );
+        // of the items matched by the measurement regex, only Measurement_Matrix, Measurement_Value are basic types
+        assert_eq!(a2l.project.module[0].measurement.len(), 2);
+        // of the items matched by the characteristic regex, only Characteristic_ValBlk, Characteristic_Value are basic types
+        assert_eq!(a2l.project.module[0].characteristic.len(), 2);
+        // Measurement_Bitfield, Curve_InternalAxis, Curve_ExternalAxis, Map_InternalAxis
+        // and Map_ExternalAxis are inserted as INSTANCEs, because they are structs
+        assert_eq!(a2l.project.module[0].instance.len(), 5);
+        assert!(
+            a2l.project.module[0]
+                .instance
+                .contains_key("Curve_InternalAxis")
+        );
+        assert!(
+            a2l.project.module[0]
+                .instance
+                .contains_key("Map_InternalAxis")
+        );
+        assert!(
+            a2l.project.module[0]
+                .instance
+                .contains_key("Measurement_Bitfield")
+        );
+        // In the C code of update_test.c, the type of Map_ExternalAxis is "struct UpdateTest_Map_ExternalAxis"
+        // a corresponding TYPEDEF_STRUCTURE should be created
+        assert!(
+            a2l.project.module[0]
+                .typedef_structure
+                .contains_key("UpdateTest_Map_ExternalAxis")
+        );
+
+        // try to insert Map_ExternalAxis again, and verify that no duplicate is created
+        let num_typedefs_before = a2l.project.module[0].typedef_structure.len();
+        let measurement_ranges = &[];
+        let characteristic_ranges = &[];
+        let measurement_regexes = vec![];
+        let characteristic_regexes = vec!["^Map_ExternalAxis$"];
+        let target_group = Some("TestGroup");
+        let mut log_msgs = Vec::new();
+        insert_many(
+            &mut a2l,
+            &debug_data,
+            measurement_ranges,
+            characteristic_ranges,
+            measurement_regexes,
+            characteristic_regexes,
+            target_group,
+            &mut log_msgs,
+            true,
+            false,
+        );
+        assert_eq!(a2l.project.module[0].instance.len(), 5);
+        assert_eq!(
+            a2l.project.module[0].typedef_structure.len(),
+            num_typedefs_before
+        );
+    }
+
+    #[test]
+    fn reject_unsuitable_types() {
+        let mut a2l = a2lfile::new();
+        let debug_data = crate::debuginfo::DebugData::load_dwarf(
+            &OsString::from("fixtures/bin/update_typedef_test.elf"),
+            false,
+        )
+        .unwrap();
+
+        // try to create a MEASUREMENT and CHARACTERISTIC for a function pointer
+        let measurement_symbols = vec!["func"];
+        let characteristic_symbols = vec!["func"];
+        let target_group = None;
+        let mut log_msgs = Vec::new();
+        insert_items(
+            &mut a2l,
+            &debug_data,
+            measurement_symbols,
+            characteristic_symbols,
+            target_group,
+            &mut log_msgs,
+            false,
+        );
+        assert_eq!(a2l.project.module[0].measurement.len(), 0);
+        assert_eq!(a2l.project.module[0].characteristic.len(), 0);
+    }
+
+    #[test]
+    fn insert_typedef_characteristic() {
+        // regression test for issue #54 - failed to insert TYPEDEF_CHARACTERISTIC
+        let mut a2l = a2lfile::new();
+        let debug_data = crate::debuginfo::DebugData::load_dwarf(
+            &OsString::from("fixtures/bin/no_a2l_demo.out"),
+            false,
+        )
+        .unwrap();
+
+        // insert an INSTANCE and a TYPEDEF_CHARACTERISTIC
+        let measurement_symbols = vec![];
+        let characteristic_symbols = vec!["params"];
+        let mut log_msgs = Vec::new();
+        insert_items(
+            &mut a2l,
+            &debug_data,
+            measurement_symbols,
+            characteristic_symbols,
+            None,
+            &mut log_msgs,
+            true,
+        );
+
+        assert_eq!(a2l.project.module[0].instance.len(), 1);
+        let inst = a2l.project.module[0].instance.get("params").unwrap();
+
+        assert_eq!(a2l.project.module[0].typedef_structure.len(), 1);
+        let td_struct = a2l.project.module[0]
+            .typedef_structure
+            .get(&inst.type_ref)
+            .unwrap();
+        assert_eq!(td_struct.structure_component.len(), 2);
+
+        assert_eq!(a2l.project.module[0].typedef_characteristic.len(), 2);
+        assert!(
+            a2l.project.module[0]
+                .typedef_characteristic
+                .contains_key(&td_struct.structure_component[0].component_type)
+        );
+        assert!(
+            a2l.project.module[0]
+                .typedef_characteristic
+                .contains_key(&td_struct.structure_component[1].component_type)
+        );
+
+        // no TYPEDEF_MEASUREMENT should be created
+        assert_eq!(a2l.project.module[0].typedef_measurement.len(), 0);
     }
 }

@@ -1,10 +1,12 @@
-use crate::dwarf::{make_simple_unit_name, DebugData, TypeInfo};
-use crate::{ifdata, A2lVersion};
+use crate::debuginfo::{DebugData, TypeInfo, make_simple_unit_name};
+use crate::{A2lVersion, ifdata};
 use a2lfile::{
     A2lFile, A2lObject, AddrType, AddressType, BitMask, CompuMethod, EcuAddress, IfData, MatrixDim,
     Module, SymbolLink,
 };
+use instance::update_all_module_instances;
 use std::collections::{HashMap, HashSet};
+use std::ops::AddAssign;
 
 mod axis_pts;
 mod blob;
@@ -15,18 +17,33 @@ mod instance;
 mod measurement;
 mod record_layout;
 pub(crate) mod typedef;
+mod variant_coding;
 
 use crate::datatype::{get_a2l_datatype, get_type_limits};
-use crate::dwarf::DwarfDataType;
-use crate::symbol::{find_symbol, SymbolInfo};
+use crate::debuginfo::DbgDataType;
+use crate::symbol::{SymbolInfo, find_symbol, find_symbol_by_offset};
 use axis_pts::*;
-use blob::{cleanup_removed_blobs, update_module_blobs};
+use blob::{cleanup_removed_blobs, update_all_module_blobs};
 use characteristic::*;
-use instance::update_module_instances;
 use measurement::*;
 use record_layout::*;
 use typedef::update_module_typedefs;
+use variant_coding::*;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpdateType {
+    Full,
+    Addresses,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpdateMode {
+    Default,
+    Strict,
+    Preserve,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct UpdateSumary {
     pub(crate) measurement_updated: u32,
     pub(crate) measurement_not_updated: u32,
@@ -38,6 +55,8 @@ pub(crate) struct UpdateSumary {
     pub(crate) blob_not_updated: u32,
     pub(crate) instance_updated: u32,
     pub(crate) instance_not_updated: u32,
+    pub(crate) var_characteristic_updated: u32,
+    pub(crate) var_characteristic_not_updated: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -54,13 +73,40 @@ pub(crate) struct TypedefNames {
     structure: HashSet<String>,
 }
 
-pub(crate) struct UpdateInfo<'a2l, 'dbg, 'log> {
-    pub(crate) module: &'a2l mut Module,
+#[derive(Debug, Clone, PartialEq)]
+enum UpdateResult {
+    Updated,
+    SymbolNotFound {
+        blocktype: &'static str,
+        name: String,
+        line: u32,
+        errors: Vec<String>,
+    },
+    InvalidDataType {
+        blocktype: &'static str,
+        name: String,
+        line: u32,
+    },
+}
+
+// the data used by the a2l update has been split into two parts.
+// The A2lUpdateInfo struct contains the data that is constant for the whole update process.
+#[derive(Debug)]
+pub(crate) struct A2lUpdateInfo<'dbg> {
     pub(crate) debug_data: &'dbg DebugData,
-    pub(crate) log_msgs: &'log mut Vec<String>,
     pub(crate) preserve_unknown: bool,
+    pub(crate) strict_update: bool,
+    pub(crate) full_update: bool,
     pub(crate) version: A2lVersion,
-    pub(crate) reclayout_info: RecordLayoutInfo,
+    pub(crate) enable_structures: bool,
+    pub(crate) use_new_arrays: bool,
+}
+
+// This struct contains the data that is modified / updated during the a2l update process.
+#[derive(Debug)]
+pub(crate) struct A2lUpdater<'a2l> {
+    module: &'a2l mut Module,
+    reclayout_info: RecordLayoutInfo,
 }
 
 type TypedefsRefInfo<'a> = HashMap<String, Vec<(Option<&'a TypeInfo>, TypedefReferrer)>>;
@@ -68,75 +114,131 @@ type TypedefsRefInfo<'a> = HashMap<String, Vec<(Option<&'a TypeInfo>, TypedefRef
 // perform an address update.
 // This update can be destructive (any object that cannot be updated will be discarded)
 // or non-destructive (addresses of invalid objects will be set to zero).
-pub(crate) fn update_addresses(
+pub(crate) fn update_a2l(
     a2l_file: &mut A2lFile,
     debug_data: &DebugData,
     log_msgs: &mut Vec<String>,
-    preserve_unknown: bool,
+    update_type: UpdateType,
+    update_mode: UpdateMode,
     enable_structures: bool,
-) -> UpdateSumary {
+    force_old_arrays: bool,
+) -> (UpdateSumary, bool) {
     let version = A2lVersion::from(&*a2l_file);
-
     let mut summary = UpdateSumary::new();
+    let mut strict_error = false;
+    let use_new_arrays = !force_old_arrays && version >= A2lVersion::V1_7_0;
+
     for module in &mut a2l_file.project.module {
-        let reclayout_info = RecordLayoutInfo::build(module);
-        let mut info = UpdateInfo {
-            module,
+        let (mut data, update_info) = init_update(
             debug_data,
-            log_msgs,
-            preserve_unknown,
+            module,
             version,
+            update_type,
+            update_mode,
+            enable_structures,
+            use_new_arrays,
+        );
+        let (module_summary, module_strict_error) = run_update(&mut data, &update_info, log_msgs);
+        summary += module_summary;
+        strict_error |= module_strict_error;
+    }
+    (summary, strict_error)
+}
+
+pub fn init_update<'a2l, 'dbg>(
+    debug_data: &'dbg DebugData,
+    module: &'a2l mut Module,
+    version: A2lVersion,
+    update_type: UpdateType,
+    update_mode: UpdateMode,
+    enable_structures: bool,
+    use_new_arrays: bool,
+) -> (A2lUpdater<'a2l>, A2lUpdateInfo<'dbg>) {
+    let preserve_unknown = update_mode == UpdateMode::Preserve;
+    let strict_update = update_mode == UpdateMode::Strict;
+    let full_update = update_type == UpdateType::Full;
+    let reclayout_info = RecordLayoutInfo::build(module);
+
+    (
+        A2lUpdater {
+            module,
             reclayout_info,
-        };
+        },
+        A2lUpdateInfo {
+            debug_data,
+            preserve_unknown,
+            strict_update,
+            full_update,
+            version,
+            enable_structures,
+            use_new_arrays,
+        },
+    )
+}
 
-        let compu_method_index = info
-            .module
-            .compu_method
-            .iter()
-            .enumerate()
-            .map(|(idx, item)| (item.name.clone(), idx))
-            .collect::<HashMap<_, _>>();
+fn run_update(
+    data: &mut A2lUpdater,
+    info: &A2lUpdateInfo,
+    log_msgs: &mut Vec<String>,
+) -> (UpdateSumary, bool) {
+    let mut summary = UpdateSumary::new();
+    let mut strict_error = false;
 
-        // update all AXIS_PTS
-        let (updated, not_updated) = update_module_axis_pts(&mut info, &compu_method_index);
-        summary.measurement_updated += updated;
-        summary.measurement_not_updated += not_updated;
+    // update all AXIS_PTS
+    let result = update_all_module_axis_pts(data, info);
+    strict_error |= result.iter().any(|r| r != &UpdateResult::Updated);
+    let (updated, not_updated) = log_update_results(log_msgs, &result);
+    summary.axis_pts_updated += updated;
+    summary.axis_pts_not_updated += not_updated;
 
-        // update all MEASUREMENTs
-        let (updated, not_updated) = update_module_measurements(&mut info, &compu_method_index);
-        summary.measurement_updated += updated;
-        summary.measurement_not_updated += not_updated;
+    // update all MEASUREMENTs
+    let results = update_all_module_measurements(data, info);
+    strict_error |= results.iter().any(|r| r != &UpdateResult::Updated);
+    let (updated, not_updated) = log_update_results(log_msgs, &results);
+    summary.measurement_updated += updated;
+    summary.measurement_not_updated += not_updated;
 
-        // update all CHARACTERISTICs
-        let (updated, not_updated) = update_module_characteristics(&mut info, &compu_method_index);
-        summary.characteristic_updated += updated;
-        summary.characteristic_not_updated += not_updated;
+    // update all CHARACTERISTICs
+    let results = update_all_module_characteristics(data, info);
+    strict_error |= results.iter().any(|r| r != &UpdateResult::Updated);
+    let (updated, not_updated) = log_update_results(log_msgs, &results);
+    summary.characteristic_updated += updated;
+    summary.characteristic_not_updated += not_updated;
 
-        // update all BLOBs
-        let (updated, not_updated) =
-            update_module_blobs(info.module, debug_data, info.log_msgs, preserve_unknown);
-        summary.blob_updated += updated;
-        summary.blob_not_updated += not_updated;
+    // update all BLOBs
+    let results = update_all_module_blobs(data, info);
+    strict_error |= results.iter().any(|r| r != &UpdateResult::Updated);
+    let (updated, not_updated) = log_update_results(log_msgs, &results);
+    summary.blob_updated += updated;
+    summary.blob_not_updated += not_updated;
 
-        let typedef_names = TypedefNames::new(info.module);
+    let typedef_names = TypedefNames::new(data.module);
 
-        // update all INSTANCEs
-        let (updated, not_updated, typedef_ref_info) =
-            update_module_instances(&mut info, &typedef_names);
-        summary.instance_updated += updated;
-        summary.instance_not_updated += not_updated;
+    // update all INSTANCEs
+    let (update_result, typedef_ref_info) = update_all_module_instances(data, info, &typedef_names);
+    strict_error |= results.iter().any(|r| r != &UpdateResult::Updated);
+    let (updated, not_updated) = log_update_results(log_msgs, &update_result);
+    summary.instance_updated += updated;
+    summary.instance_not_updated += not_updated;
 
-        if enable_structures {
-            update_module_typedefs(
-                &mut info,
-                typedef_ref_info,
-                typedef_names,
-                &compu_method_index,
-            );
-        }
+    if info.full_update && info.enable_structures {
+        update_module_typedefs(
+            info,
+            data.module,
+            log_msgs,
+            typedef_ref_info,
+            typedef_names,
+            &mut data.reclayout_info,
+        );
     }
 
-    summary
+    // update VAR_CHARACTERISTICs inside a VARIANT_CODING block
+    let results = update_variant_coding(data, info);
+    let (updated, not_updated) = log_update_results(log_msgs, &results);
+    summary.var_characteristic_updated += updated;
+    summary.var_characteristic_not_updated += not_updated;
+
+    (summary, strict_error)
 }
 
 // try to get the symbol name used in the elf file, and find its address and type
@@ -145,6 +247,7 @@ fn get_symbol_info<'a>(
     opt_symbol_link: &Option<SymbolLink>,
     ifdata_vec: &[IfData],
     debug_data: &'a DebugData,
+    use_new_arrays: bool,
 ) -> Result<SymbolInfo<'a>, Vec<String>> {
     let mut symbol_link_errmsg = None;
     let mut ifdata_errmsg = None;
@@ -152,7 +255,21 @@ fn get_symbol_info<'a>(
     // preferred: get symbol information from a SYMBOL_LINK attribute
     if let Some(symbol_link) = opt_symbol_link {
         match find_symbol(&symbol_link.symbol_name, debug_data) {
-            Ok(sym_info) => return Ok(sym_info),
+            Ok(sym_info) => {
+                if symbol_link.offset == 0 {
+                    return Ok(sym_info);
+                } else {
+                    match find_symbol_by_offset(
+                        &sym_info,
+                        symbol_link.offset,
+                        debug_data,
+                        use_new_arrays,
+                    ) {
+                        Ok(sym_info) => return Ok(sym_info),
+                        Err(errmsg) => return Err(vec![errmsg]),
+                    }
+                }
+            }
             Err(errmsg) => symbol_link_errmsg = Some(errmsg),
         };
     }
@@ -202,25 +319,68 @@ fn log_update_errors(errorlog: &mut Vec<String>, errmsgs: Vec<String>, blockname
     }
 }
 
+fn log_update_results(errorlog: &mut Vec<String>, results: &[UpdateResult]) -> (u32, u32) {
+    let mut updated = 0;
+    let mut not_updated = 0;
+    for result in results {
+        match result {
+            UpdateResult::Updated => updated += 1,
+            UpdateResult::SymbolNotFound {
+                blocktype,
+                name,
+                line,
+                errors,
+            } => {
+                for err in errors {
+                    errorlog.push(format!(
+                        "Error updating {blocktype} {name} on line {line}: {err}",
+                    ));
+                }
+                log_update_errors(errorlog, errors.clone(), blocktype, *line);
+                not_updated += 1;
+            }
+            UpdateResult::InvalidDataType {
+                blocktype,
+                name,
+                line,
+            } => {
+                errorlog.push(format!(
+                    "Error updating {blocktype} {name} on line {line}: data type has changed",
+                ));
+                updated += 1;
+            }
+        }
+    }
+
+    (updated, not_updated)
+}
+
 pub(crate) fn make_symbol_link_string(sym_info: &SymbolInfo, debug_data: &DebugData) -> String {
     let mut name = sym_info.name.to_string();
+    let mut has_discriminiant = false;
     if !sym_info.is_unique {
         if let Some(funcname) = &sym_info.function_name {
             name.push_str("{Function:");
             name.push_str(funcname);
             name.push('}');
+            has_discriminiant = true;
         }
         for ns in sym_info.namespaces {
             name.push_str("{Namespace:");
             name.push_str(ns);
             name.push('}');
+            has_discriminiant = true;
         }
         if let Some(unit_name) = make_simple_unit_name(debug_data, sym_info.unit_idx) {
             name.push_str("{CompileUnit:");
             name.push_str(&unit_name);
             name.push('}');
+            has_discriminiant = true;
         }
-        name.push_str("{Namespace:Global}");
+        if has_discriminiant {
+            // adding the tag {Namespace:Global} only makes sense if there are other tags
+            name.push_str("{Namespace:Global}");
+        }
     }
     name
 }
@@ -229,6 +389,7 @@ pub(crate) fn make_symbol_link_string(sym_info: &SymbolInfo, debug_data: &DebugD
 pub(crate) fn set_symbol_link(opt_symbol_link: &mut Option<SymbolLink>, symbol_name: String) {
     if let Some(symbol_link) = opt_symbol_link {
         symbol_link.symbol_name = symbol_name;
+        symbol_link.offset = 0; // reset offset to 0, since the symbol name now contains the full information
     } else {
         *opt_symbol_link = Some(SymbolLink::new(symbol_name, 0));
     }
@@ -244,7 +405,7 @@ pub(crate) fn set_matrix_dim(
     let mut cur_typeinfo = typeinfo;
     // compilers can represent multi-dimensional arrays in two different ways:
     // either as nested arrays, each with one dimension, or as one array with multiple dimensions
-    while let DwarfDataType::Array { dim, arraytype, .. } = &cur_typeinfo.datatype {
+    while let DbgDataType::Array { dim, arraytype, .. } = &cur_typeinfo.datatype {
         for val in dim {
             matrix_dim_values.push(u16::try_from(*val).unwrap_or(u16::MAX));
         }
@@ -272,6 +433,10 @@ pub(crate) fn set_matrix_dim(
 // this is created or updated here
 fn set_measurement_ecu_address(opt_ecu_address: &mut Option<EcuAddress>, address: u64) {
     if let Some(ecu_address) = opt_ecu_address {
+        if ecu_address.address == 0 {
+            // force hex output for the address, if the address was set as "0" (decimal)
+            ecu_address.get_layout_mut().item_location.0.1 = true;
+        }
         ecu_address.address = address as u32;
     } else {
         *opt_ecu_address = Some(EcuAddress::new(address as u32));
@@ -281,15 +446,29 @@ fn set_measurement_ecu_address(opt_ecu_address: &mut Option<EcuAddress>, address
 // CHARACTERISTIC and MEASUREMENT objects contain a BIT_MASK for bitfield elements
 // it will be created/updated/deleted here, depending on the new data type of the variable
 pub(crate) fn set_bitmask(opt_bitmask: &mut Option<BitMask>, typeinfo: &TypeInfo) {
-    if let DwarfDataType::Bitfield {
+    if let DbgDataType::Bitfield {
         bit_offset,
         bit_size,
         ..
     } = &typeinfo.datatype
     {
-        // make sure we don't panic for bit_size = 32
-        let wide_mask: u64 = ((1 << bit_size) - 1) << bit_offset;
-        let mask: u32 = wide_mask.try_into().unwrap_or(0xffff_ffff);
+        // make sure we don't panic for bit_size >= 64, etc
+        let mask = if *bit_offset >= 64 {
+            // all bits got "shifted out", so the resulting mask is 0
+            0
+        } else {
+            // to avoid overflow while shifiting, the mask size is limited to (64 - bit_offset)
+            let effective_mask_size = (*bit_size).min(64 - *bit_offset);
+
+            let unshifted_mask = if effective_mask_size == 64 {
+                // this is a bitfield with more than 64 bits, so we need to use the full 64 bits
+                u64::MAX
+            } else {
+                (1 << effective_mask_size) - 1
+            };
+            unshifted_mask << bit_offset
+        };
+
         if let Some(bit_mask) = opt_bitmask {
             bit_mask.mask = mask;
         } else {
@@ -308,7 +487,7 @@ pub(crate) fn set_bitmask(opt_bitmask: &mut Option<BitMask>, typeinfo: &TypeInfo
 
 /// set or delete the `ADDRESS_TYPE`
 pub(crate) fn set_address_type(address_type_opt: &mut Option<AddressType>, newtype: &TypeInfo) {
-    if let DwarfDataType::Pointer(ptsize, _) = &newtype.datatype {
+    if let DbgDataType::Pointer(ptsize, _) = &newtype.datatype {
         let address_type = address_type_opt.get_or_insert(AddressType::new(AddrType::Direct));
         address_type.address_type = match ptsize {
             1 => AddrType::Pbyte,
@@ -326,12 +505,11 @@ pub(crate) fn set_address_type(address_type_opt: &mut Option<AddressType>, newty
 // specifically the pseudo-standard CANAPE_EXT could be present and contain symbol information
 fn get_symbol_name_from_ifdata(ifdata_vec: &[IfData]) -> Option<String> {
     for ifdata in ifdata_vec {
-        if let Some(decoded) = ifdata::A2mlVector::load_from_ifdata(ifdata) {
-            if let Some(canape_ext) = decoded.canape_ext {
-                if let Some(link_map) = canape_ext.link_map {
-                    return Some(link_map.symbol_name);
-                }
-            }
+        if let Some(decoded) = ifdata::A2mlVector::load_from_ifdata(ifdata)
+            && let Some(canape_ext) = decoded.canape_ext
+            && let Some(link_map) = canape_ext.link_map
+        {
+            return Some(link_map.symbol_name);
         }
     }
     None
@@ -380,7 +558,7 @@ fn adjust_limits(
                         //   y = (bx + c) / f
                         // which can be inverted to
                         //   x = (fy - c) / b
-                        let func = |y: f64| (c.f * y - c.c) / c.b;
+                        let func = |y: f64| (c.f / c.b) * y - (c.c / c.b);
                         new_lower_limit = func(new_lower_limit);
                         new_upper_limit = func(new_upper_limit);
                         if new_lower_limit > new_upper_limit {
@@ -415,6 +593,19 @@ fn adjust_limits(
         }
     }
 
+    // safety check: the limits may not be infinite.
+    // This could happen if the compu method multiplies an f64 datatype limit with any number > 1
+    if new_lower_limit == -f64::INFINITY {
+        new_lower_limit = f64::MIN;
+    } else if new_lower_limit == f64::INFINITY {
+        new_lower_limit = f64::MAX;
+    }
+    if new_upper_limit == -f64::INFINITY {
+        new_upper_limit = f64::MIN;
+    } else if new_upper_limit == f64::INFINITY {
+        new_upper_limit = f64::MAX;
+    }
+
     (new_lower_limit, new_upper_limit)
 }
 
@@ -443,6 +634,8 @@ impl UpdateSumary {
             measurement_updated: 0,
             instance_not_updated: 0,
             instance_updated: 0,
+            var_characteristic_not_updated: 0,
+            var_characteristic_updated: 0,
         }
     }
 }
@@ -450,31 +643,11 @@ impl UpdateSumary {
 impl TypedefNames {
     pub(crate) fn new(module: &Module) -> Self {
         Self {
-            axis: module
-                .typedef_axis
-                .iter()
-                .map(|item| item.name.clone())
-                .collect(),
-            blob: module
-                .typedef_blob
-                .iter()
-                .map(|item| item.name.clone())
-                .collect(),
-            characteristic: module
-                .typedef_characteristic
-                .iter()
-                .map(|item| item.name.clone())
-                .collect(),
-            measurement: module
-                .typedef_measurement
-                .iter()
-                .map(|item| item.name.clone())
-                .collect(),
-            structure: module
-                .typedef_structure
-                .iter()
-                .map(|item| item.name.clone())
-                .collect(),
+            axis: module.typedef_axis.keys().cloned().collect(),
+            blob: module.typedef_blob.keys().cloned().collect(),
+            characteristic: module.typedef_characteristic.keys().cloned().collect(),
+            measurement: module.typedef_measurement.keys().cloned().collect(),
+            structure: module.typedef_structure.keys().cloned().collect(),
         }
     }
 
@@ -487,18 +660,40 @@ impl TypedefNames {
     }
 }
 
+impl AddAssign for UpdateSumary {
+    fn add_assign(&mut self, other: Self) {
+        self.axis_pts_not_updated += other.axis_pts_not_updated;
+        self.axis_pts_updated += other.axis_pts_updated;
+        self.blob_not_updated += other.blob_not_updated;
+        self.blob_updated += other.blob_updated;
+        self.characteristic_not_updated += other.characteristic_not_updated;
+        self.characteristic_updated += other.characteristic_updated;
+        self.measurement_not_updated += other.measurement_not_updated;
+        self.measurement_updated += other.measurement_updated;
+        self.instance_not_updated += other.instance_not_updated;
+        self.instance_updated += other.instance_updated;
+    }
+}
+
 #[cfg(test)]
 mod test {
-    use super::adjust_limits;
-    use crate::dwarf::{DwarfDataType, TypeInfo};
-    use a2lfile::{Coeffs, CoeffsLinear, CompuMethod, ConversionType};
+    use super::*;
+    use crate::{
+        A2lVersion,
+        debuginfo::{DbgDataType, TypeInfo},
+    };
+    use a2lfile::{
+        A2lObjectName, Characteristic, CharacteristicType, Coeffs, CoeffsLinear, CompuMethod,
+        ConversionType, DataType, IndexMode, RecordLayout,
+    };
+    use std::ffi::OsString;
 
     #[test]
     fn test_adjust_limits() {
         let typeinfo = TypeInfo {
             name: None,
             unit_idx: 0,
-            datatype: DwarfDataType::Uint8,
+            datatype: DbgDataType::Uint8,
             dbginfo_offset: 0,
         };
         let mut compu_method = CompuMethod::new(
@@ -518,7 +713,7 @@ mod test {
         let typeinfo = TypeInfo {
             name: None,
             unit_idx: 0,
-            datatype: DwarfDataType::Uint8,
+            datatype: DbgDataType::Uint8,
             dbginfo_offset: 0,
         };
         let mut compu_method = CompuMethod::new(
@@ -533,5 +728,613 @@ mod test {
         let (lower, upper) = adjust_limits(&typeinfo, 0.0, 0.0, Some(&compu_method));
         assert_eq!(lower, 0.0);
         assert_eq!(upper, 10200.0);
+
+        // for some RAT_FUNC compu method parameters, the limit calculation can go to infinity.
+        // Even the calculation order is a concern here, since multiplication before division
+        // could cause this even if the end result should be smaller than f64::MAX
+        let typeinfo = TypeInfo {
+            name: None,
+            unit_idx: 0,
+            datatype: DbgDataType::Double,
+            dbginfo_offset: 0,
+        };
+        let mut compu_method = CompuMethod::new(
+            "name".to_string(),
+            "".to_string(),
+            ConversionType::RatFunc,
+            "".to_string(),
+            "".to_string(),
+        );
+        compu_method.coeffs = Some(Coeffs::new(0., 4.0, 0., 0., 0., 2.0));
+
+        let (lower, upper) = adjust_limits(&typeinfo, f64::MIN, f64::MAX, Some(&compu_method));
+        assert_ne!(lower, f64::MIN);
+        assert_ne!(upper, f64::MAX);
+    }
+
+    fn test_setup(a2l_name: &str) -> (crate::debuginfo::DebugData, a2lfile::A2lFile) {
+        let (a2l, _) =
+            a2lfile::load(a2l_name, Some(ifdata::A2MLVECTOR_TEXT.to_string()), true).unwrap();
+        let debug_data = crate::debuginfo::DebugData::load_dwarf(
+            &OsString::from("fixtures/bin/update_test.elf"),
+            false,
+        )
+        .unwrap();
+        (debug_data, a2l)
+    }
+
+    #[test]
+    fn test_update_axis_pts_ok() {
+        let (debug_data, mut a2l) = test_setup("fixtures/a2l/update_test1.a2l");
+
+        // test address only update, in strict mode
+        let version = A2lVersion::from(&a2l);
+        let (mut data, info) = init_update(
+            &debug_data,
+            &mut a2l.project.module[0],
+            version,
+            UpdateType::Addresses,
+            UpdateMode::Strict,
+            true,
+            false,
+        );
+
+        let mut log_msgs = Vec::new();
+        let result = update_all_module_axis_pts(&mut data, &info);
+        assert!(result.iter().all(|r| r == &UpdateResult::Updated));
+        assert_eq!(result.len(), 3);
+        let (updated, not_updated) = log_update_results(&mut log_msgs, &result);
+        assert_eq!(updated, 3);
+        assert_eq!(not_updated, 0);
+        assert!(log_msgs.is_empty());
+
+        // test full update
+        let version = A2lVersion::from(&a2l);
+        let (mut data, info) = init_update(
+            &debug_data,
+            &mut a2l.project.module[0],
+            version,
+            UpdateType::Full,
+            UpdateMode::Default,
+            true,
+            false,
+        );
+
+        let mut log_msgs = Vec::new();
+        let result = update_all_module_axis_pts(&mut data, &info);
+        assert!(result.iter().all(|r| r == &UpdateResult::Updated));
+        assert_eq!(result.len(), 3);
+        let (updated, not_updated) = log_update_results(&mut log_msgs, &result);
+        assert_eq!(updated, 3);
+        assert_eq!(not_updated, 0);
+        assert!(log_msgs.is_empty());
+    }
+
+    #[test]
+    fn test_update_axis_pts_bad() {
+        let (debug_data, mut a2l) = test_setup("fixtures/a2l/update_test2.a2l");
+
+        // test address only update, in strict mode
+        let version = A2lVersion::from(&a2l);
+        let (mut data, info) = init_update(
+            &debug_data,
+            &mut a2l.project.module[0],
+            version,
+            UpdateType::Addresses,
+            UpdateMode::Strict,
+            true,
+            false,
+        );
+        let result = update_all_module_axis_pts(&mut data, &info);
+        assert_eq!(result.len(), 4);
+        assert!(matches!(result[0], UpdateResult::InvalidDataType { .. }));
+        assert!(matches!(result[1], UpdateResult::InvalidDataType { .. }));
+        assert!(matches!(result[2], UpdateResult::Updated));
+        assert!(matches!(result[3], UpdateResult::SymbolNotFound { .. }));
+    }
+
+    #[test]
+    fn test_update_blob_ok() {
+        let (debug_data, mut a2l) = test_setup("fixtures/a2l/update_test1.a2l");
+
+        // test address only update, in strict mode
+        let version = A2lVersion::from(&a2l);
+        let (mut data, info) = init_update(
+            &debug_data,
+            &mut a2l.project.module[0],
+            version,
+            UpdateType::Addresses,
+            UpdateMode::Strict,
+            true,
+            false,
+        );
+
+        let mut log_msgs = Vec::new();
+        let result = update_all_module_blobs(&mut data, &info);
+        assert!(result.iter().all(|r| r == &UpdateResult::Updated));
+        assert_eq!(result.len(), 2);
+        let (updated, not_updated) = log_update_results(&mut log_msgs, &result);
+        assert_eq!(updated, 2);
+        assert_eq!(not_updated, 0);
+        assert!(log_msgs.is_empty());
+
+        // test full update
+        let version = A2lVersion::from(&a2l);
+        let (mut data, info) = init_update(
+            &debug_data,
+            &mut a2l.project.module[0],
+            version,
+            UpdateType::Full,
+            UpdateMode::Default,
+            true,
+            false,
+        );
+
+        let mut log_msgs = Vec::new();
+        let result = update_all_module_blobs(&mut data, &info);
+        assert!(result.iter().all(|r| r == &UpdateResult::Updated));
+        assert_eq!(result.len(), 2);
+        let (updated, not_updated) = log_update_results(&mut log_msgs, &result);
+        assert_eq!(updated, 2);
+        assert_eq!(not_updated, 0);
+        assert!(log_msgs.is_empty());
+    }
+
+    #[test]
+    fn test_update_blob_bad() {
+        let (debug_data, mut a2l) = test_setup("fixtures/a2l/update_test2.a2l");
+
+        // test address only update, in strict mode
+        let version = A2lVersion::from(&a2l);
+        let (mut data, info) = init_update(
+            &debug_data,
+            &mut a2l.project.module[0],
+            version,
+            UpdateType::Addresses,
+            UpdateMode::Strict,
+            true,
+            false,
+        );
+        let result = update_all_module_blobs(&mut data, &info);
+        assert_eq!(result.len(), 3);
+        assert!(matches!(result[0], UpdateResult::InvalidDataType { .. }));
+        assert!(matches!(result[1], UpdateResult::Updated));
+        assert!(matches!(result[2], UpdateResult::SymbolNotFound { .. }));
+    }
+
+    #[test]
+    fn test_update_characteristic_ok() {
+        let (debug_data, mut a2l) = test_setup("fixtures/a2l/update_test1.a2l");
+
+        // test address only update, in strict mode
+        let version = A2lVersion::from(&a2l);
+        let (mut data, info) = init_update(
+            &debug_data,
+            &mut a2l.project.module[0],
+            version,
+            UpdateType::Addresses,
+            UpdateMode::Strict,
+            true,
+            false,
+        );
+
+        let mut log_msgs = Vec::new();
+        let result = update_all_module_characteristics(&mut data, &info);
+        assert!(result.iter().all(|r| r == &UpdateResult::Updated));
+        assert_eq!(result.len(), 6);
+        let (updated, not_updated) = log_update_results(&mut log_msgs, &result);
+        assert_eq!(updated, 6);
+        assert_eq!(not_updated, 0);
+        assert!(log_msgs.is_empty());
+
+        // test full update
+        let version = A2lVersion::from(&a2l);
+        let (mut data, info) = init_update(
+            &debug_data,
+            &mut a2l.project.module[0],
+            version,
+            UpdateType::Full,
+            UpdateMode::Default,
+            true,
+            false,
+        );
+
+        let mut log_msgs = Vec::new();
+        let result = update_all_module_characteristics(&mut data, &info);
+        assert!(result.iter().all(|r| r == &UpdateResult::Updated));
+        assert_eq!(result.len(), 6);
+        let (updated, not_updated) = log_update_results(&mut log_msgs, &result);
+        assert_eq!(updated, 6);
+        assert_eq!(not_updated, 0);
+        assert!(log_msgs.is_empty());
+    }
+
+    #[test]
+    fn test_update_characteristic_bad() {
+        let (debug_data, mut a2l) = test_setup("fixtures/a2l/update_test2.a2l");
+
+        // test address only update, in strict mode
+        let version = A2lVersion::from(&a2l);
+        let (mut data, info) = init_update(
+            &debug_data,
+            &mut a2l.project.module[0],
+            version,
+            UpdateType::Addresses,
+            UpdateMode::Strict,
+            true,
+            false,
+        );
+        let result = update_all_module_characteristics(&mut data, &info);
+        assert_eq!(result.len(), 7);
+        assert!(matches!(result[0], UpdateResult::InvalidDataType { .. }));
+        // assert!(matches!(result[1], UpdateResult::InvalidDataType { .. })); // verify currently does not check the size in AXIS_DESCR
+        assert!(matches!(result[2], UpdateResult::InvalidDataType { .. }));
+        assert!(matches!(result[3], UpdateResult::Updated));
+        assert!(matches!(result[4], UpdateResult::InvalidDataType { .. }));
+        assert!(matches!(result[5], UpdateResult::InvalidDataType { .. }));
+        assert!(matches!(result[6], UpdateResult::SymbolNotFound { .. }));
+    }
+
+    #[test]
+    fn test_update_instance_ok() {
+        let (debug_data, mut a2l) = test_setup("fixtures/a2l/update_test1.a2l");
+
+        // test address only update, in strict mode
+        let version = A2lVersion::from(&a2l);
+        let (mut data, info) = init_update(
+            &debug_data,
+            &mut a2l.project.module[0],
+            version,
+            UpdateType::Addresses,
+            UpdateMode::Strict,
+            true,
+            false,
+        );
+
+        let mut log_msgs = Vec::new();
+        let typedef_names = TypedefNames::new(data.module);
+        let (result, _) = update_all_module_instances(&mut data, &info, &typedef_names);
+        assert!(result.iter().all(|r| r == &UpdateResult::Updated));
+        assert_eq!(result.len(), 1);
+        let (updated, not_updated) = log_update_results(&mut log_msgs, &result);
+        assert_eq!(updated, 1);
+        assert_eq!(not_updated, 0);
+        assert!(log_msgs.is_empty());
+
+        // test full update
+        let version = A2lVersion::from(&a2l);
+        let (mut data, info) = init_update(
+            &debug_data,
+            &mut a2l.project.module[0],
+            version,
+            UpdateType::Full,
+            UpdateMode::Default,
+            true,
+            false,
+        );
+
+        let mut log_msgs = Vec::new();
+        let typedef_names = TypedefNames::new(data.module);
+        let (result, _) = update_all_module_instances(&mut data, &info, &typedef_names);
+        assert!(result.iter().all(|r| r == &UpdateResult::Updated));
+        assert_eq!(result.len(), 1);
+        let (updated, not_updated) = log_update_results(&mut log_msgs, &result);
+        assert_eq!(updated, 1);
+        assert_eq!(not_updated, 0);
+        assert!(log_msgs.is_empty());
+    }
+
+    #[test]
+    fn test_update_instance_bad() {
+        let (debug_data, mut a2l) = test_setup("fixtures/a2l/update_test2.a2l");
+
+        // test address only update, in strict mode
+        let version = A2lVersion::from(&a2l);
+        let (mut data, info) = init_update(
+            &debug_data,
+            &mut a2l.project.module[0],
+            version,
+            UpdateType::Addresses,
+            UpdateMode::Strict,
+            true,
+            false,
+        );
+        let typedef_names = TypedefNames::new(data.module);
+        let (result, _) = update_all_module_instances(&mut data, &info, &typedef_names);
+        assert_eq!(result.len(), 3);
+        assert!(matches!(result[0], UpdateResult::Updated));
+        assert!(matches!(result[1], UpdateResult::Updated));
+        assert!(matches!(result[2], UpdateResult::SymbolNotFound { .. }));
+    }
+
+    #[test]
+    fn test_update_measurement_ok() {
+        let (debug_data, mut a2l) = test_setup("fixtures/a2l/update_test1.a2l");
+
+        // test address only update, in strict mode
+        let version = A2lVersion::from(&a2l);
+        let (mut data, info) = init_update(
+            &debug_data,
+            &mut a2l.project.module[0],
+            version,
+            UpdateType::Full,
+            UpdateMode::Default,
+            true,
+            false,
+        );
+
+        let mut log_msgs = Vec::new();
+        let result = update_all_module_measurements(&mut data, &info);
+        assert!(result.iter().all(|r| r == &UpdateResult::Updated));
+        assert_eq!(result.len(), 6);
+        let (updated, not_updated) = log_update_results(&mut log_msgs, &result);
+        assert_eq!(updated, 6);
+        assert_eq!(not_updated, 0);
+        assert!(log_msgs.is_empty());
+
+        // test full update
+        let version = A2lVersion::from(&a2l);
+        let (mut data, info) = init_update(
+            &debug_data,
+            &mut a2l.project.module[0],
+            version,
+            UpdateType::Full,
+            UpdateMode::Default,
+            true,
+            false,
+        );
+
+        let mut log_msgs = Vec::new();
+        let result = update_all_module_measurements(&mut data, &info);
+        assert!(result.iter().all(|r| r == &UpdateResult::Updated));
+        assert_eq!(result.len(), 6);
+        let (updated, not_updated) = log_update_results(&mut log_msgs, &result);
+        assert_eq!(updated, 6);
+        assert_eq!(not_updated, 0);
+        assert!(log_msgs.is_empty());
+    }
+
+    #[test]
+    fn test_update_measurement_bad() {
+        let (debug_data, mut a2l) = test_setup("fixtures/a2l/update_test2.a2l");
+
+        // test address only update, in strict mode
+        let version = A2lVersion::from(&a2l);
+        let (mut data, info) = init_update(
+            &debug_data,
+            &mut a2l.project.module[0],
+            version,
+            UpdateType::Addresses,
+            UpdateMode::Strict,
+            true,
+            false,
+        );
+        let result = update_all_module_measurements(&mut data, &info);
+        assert_eq!(result.len(), 7);
+        assert!(matches!(result[0], UpdateResult::InvalidDataType { .. }));
+        assert!(matches!(result[1], UpdateResult::InvalidDataType { .. }));
+        assert!(matches!(result[2], UpdateResult::InvalidDataType { .. }));
+        assert!(matches!(result[3], UpdateResult::Updated));
+        assert!(matches!(result[4], UpdateResult::Updated));
+        assert!(matches!(result[5], UpdateResult::InvalidDataType { .. }));
+        assert!(matches!(result[6], UpdateResult::SymbolNotFound { .. }));
+    }
+
+    #[test]
+    fn test_update_a2l_ok() {
+        let (debug_data, mut a2l) = test_setup("fixtures/a2l/update_test1.a2l");
+
+        // test address only update, in strict mode
+        let mut log_msgs = Vec::new();
+        let (summary, strict_error) = update_a2l(
+            &mut a2l,
+            &debug_data,
+            &mut log_msgs,
+            UpdateType::Addresses,
+            UpdateMode::Strict,
+            false,
+            false,
+        );
+        assert!(!strict_error);
+        assert_eq!(summary.axis_pts_not_updated, 0);
+        assert_eq!(summary.axis_pts_updated, 3);
+        assert_eq!(summary.blob_not_updated, 0);
+        assert_eq!(summary.blob_updated, 2);
+        assert_eq!(summary.characteristic_not_updated, 0);
+        assert_eq!(summary.characteristic_updated, 6);
+        assert_eq!(summary.measurement_not_updated, 0);
+        assert_eq!(summary.measurement_updated, 6);
+        assert_eq!(summary.instance_not_updated, 0);
+        assert_eq!(summary.instance_updated, 1);
+        assert!(log_msgs.is_empty());
+
+        // test full update
+        let mut log_msgs = Vec::new();
+        let (summary, _) = update_a2l(
+            &mut a2l,
+            &debug_data,
+            &mut log_msgs,
+            UpdateType::Full,
+            UpdateMode::Default,
+            false,
+            false,
+        );
+        assert_eq!(summary.axis_pts_not_updated, 0);
+        assert_eq!(summary.axis_pts_updated, 3);
+        assert_eq!(summary.blob_not_updated, 0);
+        assert_eq!(summary.blob_updated, 2);
+        assert_eq!(summary.characteristic_not_updated, 0);
+        assert_eq!(summary.characteristic_updated, 6);
+        assert_eq!(summary.measurement_not_updated, 0);
+        assert_eq!(summary.measurement_updated, 6);
+        assert_eq!(summary.instance_not_updated, 0);
+        assert_eq!(summary.instance_updated, 1);
+        assert!(log_msgs.is_empty());
+    }
+
+    #[test]
+    fn test_symbol_with_offset() {
+        // load update_test.elf
+        // This file contains:
+        //    struct UpdateTest_ComplexBlobData {
+        //        uint32_t value_1[16];
+        //        struct {
+        //            uint16_t value_2_1;
+        //            uint32_t value_2_2;
+        //        } value_2[8];
+        //    };
+        //    struct UpdateTest_ComplexBlobData Blob_1;
+        let debug_data = crate::debuginfo::DebugData::load_dwarf(
+            &OsString::from("fixtures/bin/update_test.elf"),
+            false,
+        )
+        .unwrap();
+
+        let symbol_link_base = a2lfile::SymbolLink::new("Blob_1".to_string(), 0);
+        let sym_info =
+            get_symbol_info("", &Some(symbol_link_base), &[], &debug_data, false).unwrap();
+        let base_address = sym_info.address;
+        assert!(base_address != 0);
+        assert!(matches!(
+            sym_info.typeinfo.datatype,
+            DbgDataType::Struct { .. }
+        ));
+
+        // offset 8 is inside the first array of the struct, so the symbol name should be "Blob_1.value_1[2]"
+        let symbol_link_elem = a2lfile::SymbolLink::new("Blob_1".to_string(), 8);
+        let sym_info =
+            get_symbol_info("", &Some(symbol_link_elem), &[], &debug_data, false).unwrap();
+        assert_eq!(sym_info.address, base_address + 8);
+        assert_eq!(sym_info.name, "Blob_1.value_1._2_");
+        assert!(matches!(sym_info.typeinfo.datatype, DbgDataType::Uint32));
+
+        // offset 68 is inside the second array of the struct
+        let symbol_link_elem = a2lfile::SymbolLink::new("Blob_1".to_string(), 68);
+        let sym_info =
+            get_symbol_info("", &Some(symbol_link_elem), &[], &debug_data, false).unwrap();
+        assert_eq!(sym_info.address, base_address + 68);
+        assert_eq!(sym_info.name, "Blob_1.value_2._0_.value_2_2");
+        assert!(matches!(sym_info.typeinfo.datatype, DbgDataType::Uint32));
+
+        // offset 1000 is outside the struct, which should trigger an error
+        let symbol_link_elem = a2lfile::SymbolLink::new("Blob_1".to_string(), 1000);
+        let sym_info_result = get_symbol_info("", &Some(symbol_link_elem), &[], &debug_data, false);
+        assert!(sym_info_result.is_err());
+
+        // a2l allows negative offsets, which makes no sense at all. This also triggers an error
+        let symbol_link_elem = a2lfile::SymbolLink::new("Blob_1".to_string(), -1);
+        let sym_info_result = get_symbol_info("", &Some(symbol_link_elem), &[], &debug_data, false);
+        assert!(sym_info_result.is_err());
+    }
+
+    fn make_bitfield_type(offset: u16, mask: u16) -> TypeInfo {
+        TypeInfo {
+            name: None,
+            unit_idx: 0,
+            datatype: DbgDataType::Bitfield {
+                basetype: Box::new(TypeInfo {
+                    name: None,
+                    unit_idx: 0,
+                    datatype: DbgDataType::Uint64,
+                    dbginfo_offset: 0,
+                }),
+                bit_offset: offset,
+                bit_size: mask,
+            },
+            dbginfo_offset: 0,
+        }
+    }
+
+    #[test]
+    fn test_bitmask() {
+        // offset too big - all bits are shifted out, so the mask is 0
+        let typeinfo = make_bitfield_type(64, 1);
+        let mut opt_bm = Some(BitMask::new(0));
+        set_bitmask(&mut opt_bm, &typeinfo);
+        assert_eq!(opt_bm.unwrap().mask, 0);
+
+        // mask too big, it is clipped to 64 bits
+        let typeinfo = make_bitfield_type(0, 65);
+        let mut opt_bm = Some(BitMask::new(0));
+        set_bitmask(&mut opt_bm, &typeinfo);
+        assert_eq!(opt_bm.unwrap().mask, u64::MAX);
+
+        // offset + mask too big - some upper bits are lost
+        let typeinfo = make_bitfield_type(33, 33);
+        let mut opt_bm = Some(BitMask::new(0));
+        set_bitmask(&mut opt_bm, &typeinfo);
+        assert_eq!(
+            opt_bm.unwrap().mask,
+            0b1111_1111_1111_1111_1111_1111_1111_1110_0000_0000_0000_0000_0000_0000_0000_0000
+        );
+
+        // normal values, should succeed without errors or clipping
+        let typeinfo = make_bitfield_type(2, 2);
+        let mut opt_bm = Some(BitMask::new(0));
+        set_bitmask(&mut opt_bm, &typeinfo);
+        assert_eq!(opt_bm.unwrap().mask, 0b1100);
+
+        let typeinfo = make_bitfield_type(5, 3);
+        let mut opt_bm = Some(BitMask::new(0));
+        set_bitmask(&mut opt_bm, &typeinfo);
+        assert_eq!(opt_bm.unwrap().mask, 0b11100000);
+    }
+
+    #[test]
+    fn test_update_with_offset() {
+        let debug_data = crate::debuginfo::DebugData::load_dwarf(
+            &OsString::from("fixtures/bin/update_test.elf"),
+            false,
+        )
+        .unwrap();
+        let mut a2l = a2lfile::new();
+
+        // create a characteristic with a symbol link that has an offset into an array
+        // The symbol "Characteristic_ValBlk" is defined in update_test.elf as
+        // float Characteristic_ValBlk[5]
+        let mut chr = Characteristic::new(
+            "test".to_string(),
+            String::new(),
+            CharacteristicType::Value,
+            0,
+            "record_layout".to_string(),
+            0.0,
+            "NO_COMPU_METHOD".to_string(),
+            0.0,
+            100.0,
+        );
+        chr.symbol_link = Some(a2lfile::SymbolLink::new(
+            "Characteristic_ValBlk".to_string(),
+            16,
+        ));
+        let mut rl = RecordLayout::new("record_layout".to_string());
+        rl.fnc_values = Some(a2lfile::FncValues::new(
+            0,
+            DataType::Float32Ieee,
+            IndexMode::RowDir,
+            AddrType::Direct,
+        ));
+        a2l.project.module[0].characteristic.push(chr);
+
+        // perform address update
+        let mut log_msgs = Vec::new();
+        update_a2l(
+            &mut a2l,
+            &debug_data,
+            &mut log_msgs,
+            UpdateType::Addresses,
+            UpdateMode::Strict,
+            false,
+            false,
+        );
+
+        let chr = &a2l.project.module[0].characteristic[0];
+        assert_eq!(chr.get_name(), "test");
+        assert_eq!(
+            chr.symbol_link.as_ref().unwrap().symbol_name,
+            "Characteristic_ValBlk[4]"
+        );
+        assert_eq!(chr.symbol_link.as_ref().unwrap().offset, 0);
+        assert_ne!(chr.address, 0);
     }
 }

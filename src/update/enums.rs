@@ -1,6 +1,6 @@
-use crate::dwarf::{DwarfDataType, TypeInfo};
+use crate::debuginfo::{DbgDataType, TypeInfo};
 use a2lfile::{
-    CompuMethod, CompuTabRef, CompuVtab, ConversionType, Module, ValuePairsStruct,
+    A2lObjectName, CompuMethod, CompuTabRef, CompuVtab, ConversionType, Module, ValuePairsStruct,
     ValueTriplesStruct,
 };
 use std::collections::HashMap;
@@ -11,11 +11,8 @@ pub(crate) fn cond_create_enum_conversion(
     typename: &str,
     enumerators: &[(String, i64)],
 ) {
-    let compu_method_find = module
-        .compu_method
-        .iter()
-        .find(|item| item.name == typename);
-    if compu_method_find.is_none() {
+    let compu_method = module.compu_method.get(typename);
+    if compu_method.is_none() {
         let mut new_compu_method = CompuMethod::new(
             typename.to_string(),
             format!("Conversion table for enum {typename}"),
@@ -26,13 +23,10 @@ pub(crate) fn cond_create_enum_conversion(
         new_compu_method.compu_tab_ref = Some(CompuTabRef::new(typename.to_string()));
         module.compu_method.push(new_compu_method);
 
-        let compu_vtab_find = module.compu_vtab.iter().find(|item| item.name == typename);
-        let compu_vtab_range_find = module
-            .compu_vtab_range
-            .iter()
-            .find(|item| item.name == typename);
+        let compu_vtab = module.compu_vtab.get(typename);
+        let compu_vtab_range = module.compu_vtab_range.get(typename);
 
-        if compu_vtab_find.is_none() && compu_vtab_range_find.is_none() {
+        if compu_vtab.is_none() && compu_vtab_range.is_none() {
             let mut new_compu_vtab = CompuVtab::new(
                 typename.to_string(),
                 format!("Conversion table for enum {typename}"),
@@ -67,23 +61,23 @@ pub(crate) fn update_enum_compu_methods(
     // follow the chain of objects and build a list of COMPU_TAB_REF references with their associated enum types
     let mut enum_compu_tab = HashMap::new();
     for compu_method in &module.compu_method {
-        if let Some(typeinfo) = enum_convlist.get(&compu_method.name) {
-            if let Some(compu_tab) = &compu_method.compu_tab_ref {
-                enum_compu_tab.insert(compu_tab.conversion_table.clone(), *typeinfo);
-            }
+        if let Some(typeinfo) = enum_convlist.get(compu_method.get_name())
+            && let Some(compu_tab) = &compu_method.compu_tab_ref
+        {
+            enum_compu_tab.insert(compu_tab.conversion_table.clone(), *typeinfo);
         }
     }
 
     // check all COMPU_VTABs in the module to see if we know of an associated enum type
     for compu_vtab in &mut module.compu_vtab {
         if let Some(TypeInfo {
-            datatype: DwarfDataType::Enum { enumerators, .. },
+            datatype: DbgDataType::Enum { enumerators, .. },
             ..
-        }) = enum_compu_tab.get(&compu_vtab.name)
+        }) = enum_compu_tab.get(compu_vtab.get_name())
         {
             // some enums are not sorted by ID in the source, but we want to output sorted COMPU_VTABs
             let mut enumerators = enumerators.clone();
-            enumerators.sort_by(|e1, e2| e1.1.cmp(&e2.1));
+            enumerators.sort_by_key(|e1| e1.1);
 
             // TabVerb is the only permitted conversion type for a compu_vtab
             compu_vtab.conversion_type = ConversionType::TabVerb;
@@ -111,13 +105,13 @@ pub(crate) fn update_enum_compu_methods(
     // do the same for COMPU_VTAB_RANGE, because the enum could also be stored as a COMPU_VTAB_RANGE where min = max for all entries
     for compu_vtab_range in &mut module.compu_vtab_range {
         if let Some(TypeInfo {
-            datatype: DwarfDataType::Enum { enumerators, .. },
+            datatype: DbgDataType::Enum { enumerators, .. },
             ..
-        }) = enum_compu_tab.get(&compu_vtab_range.name)
+        }) = enum_compu_tab.get(compu_vtab_range.get_name())
         {
             // some enums are not sorted by ID in the source, but we want to output sorted COMPU_VTAB_RANGEs
             let mut enumerators = enumerators.clone();
-            enumerators.sort_by(|e1, e2| e1.1.cmp(&e2.1));
+            enumerators.sort_by_key(|e1| e1.1);
 
             // if compu_vtab_range has more entries than the enum, delete the extras
             while compu_vtab_range.value_triples.len() > enumerators.len() {

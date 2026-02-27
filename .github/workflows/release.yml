@@ -1,0 +1,174 @@
+name: Release Workflow
+
+on:
+  push:
+    tags:
+      - 'v*' # e.g. v1.0.0
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            binary: a2ltool
+          - os: windows
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: a2ltool.exe
+    env:
+      ZIP_NAME: a2ltool-${{ matrix.os }}-${{ github.ref_name }}.zip
+          
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Git LFS
+        run: git lfs install --system --skip-repo
+
+      - name: Checkout LFS objects
+        run: git lfs pull
+
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+          components: llvm-tools-preview
+          target: ${{ matrix.target }}
+
+      - name: Cache Rust artifacts
+        # cache all dependencies to speed up the workflow
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-pgo
+        run: cargo install cargo-pgo
+
+      - name: Build instrumented binary
+        run: |
+          cargo pgo build -- --target ${{ matrix.target }}
+
+      - name: debug-ls-linux
+        # On linux, list the content of target to make sure cargo pgo is build for the correct target triple
+        if: matrix.os == 'linux'
+        run: |
+          cd target
+          ls
+
+      - name: gather PGO profiles
+        run: |
+          target/${{ matrix.target }}/release/${{ matrix.binary }} fixtures/a2l/software_a.a2l --elffile fixtures/bin/software_a.elf --update FULL --sort --cleanup --merge-includes --ifdata-cleanup --output fixtures/out.a2l
+          target/${{ matrix.target }}/release/${{ matrix.binary }} --create --a2lversion 1.7.1 --elffile fixtures/bin/software_a.elf --measurement-regex ".*" --update FULL --sort --output fixtures/out.a2l
+          target/${{ matrix.target }}/release/${{ matrix.binary }} --create --a2lversion 1.7.1 --elffile fixtures/bin/software_a.elf --enable-structures --measurement-regex ".*" --update FULL --sort --output fixtures/out.a2l
+          target/${{ matrix.target }}/release/${{ matrix.binary }} fixtures/out.a2l
+          target/${{ matrix.target }}/release/${{ matrix.binary }} --create --a2lversion 1.7.1 --elffile fixtures/bin/software_a.elf --characteristic-regex ".*" --update FULL --sort --output fixtures/out.a2l
+          target/${{ matrix.target }}/release/${{ matrix.binary }} --create --a2lversion 1.7.1 --elffile fixtures/bin/software_a.elf --enable-structures --characteristic-regex ".*" --update FULL --sort --output fixtures/out.a2l
+          target/${{ matrix.target }}/release/${{ matrix.binary }} fixtures/out.a2l
+
+          target/${{ matrix.target }}/release/${{ matrix.binary }} fixtures/a2l/software_b.a2l --elffile fixtures/bin/software_b.elf --update FULL --sort --cleanup --merge-includes --ifdata-cleanup --output fixtures/out.a2l
+          target/${{ matrix.target }}/release/${{ matrix.binary }} --create --a2lversion 1.7.1 --elffile fixtures/bin/software_b.elf --measurement-regex ".*" --update FULL --sort --output fixtures/out.a2l
+          target/${{ matrix.target }}/release/${{ matrix.binary }} --create --a2lversion 1.7.1 --elffile fixtures/bin/software_b.elf --enable-structures --measurement-regex ".*" --update FULL --sort --output fixtures/out.a2l
+          target/${{ matrix.target }}/release/${{ matrix.binary }} fixtures/out.a2l
+          target/${{ matrix.target }}/release/${{ matrix.binary }} --create --a2lversion 1.7.1 --elffile fixtures/bin/software_b.elf --characteristic-regex ".*" --update FULL --sort --output fixtures/out.a2l
+          target/${{ matrix.target }}/release/${{ matrix.binary }} --create --a2lversion 1.7.1 --elffile fixtures/bin/software_b.elf --enable-structures --characteristic-regex ".*" --update FULL --sort --output fixtures/out.a2l
+          target/${{ matrix.target }}/release/${{ matrix.binary }} fixtures/out.a2l
+
+          target/${{ matrix.target }}/release/${{ matrix.binary }} --create --elffile fixtures/bin/debugdata_clang.elf --measurement-regex staticvar.* --characteristic-regex structvar.*
+          target/${{ matrix.target }}/release/${{ matrix.binary }} --create --elffile fixtures/bin/debugdata_gcc.elf --measurement-regex staticvar.* --characteristic-regex structvar.*
+          target/${{ matrix.target }}/release/${{ matrix.binary }} --create --elffile fixtures/bin/debugdata_gcc.exe --measurement-regex staticvar.* --characteristic-regex structvar.*
+          target/${{ matrix.target }}/release/${{ matrix.binary }} --create --pdbfile fixtures/bin/debugdata_cl.pdb --measurement-regex staticvar.* --characteristic-regex structvar.*
+          target/${{ matrix.target }}/release/${{ matrix.binary }} --create --pdbfile fixtures/bin/debugdata_clang.pdb --measurement-regex staticvar.* --characteristic-regex structvar.*
+
+      - name: Build optimized binary
+        run: |
+          cargo pgo optimize build -- --target ${{ matrix.target }}
+
+      - name: zip-linux
+        # On linux we use the zip command to create the archive
+        if: matrix.os == 'linux'
+        run: |
+          cd target/${{ matrix.target }}/release/
+          zip ${{ env.ZIP_NAME }} ${{ matrix.binary }}
+  
+      - name: zip-windows
+        # windows doesn't have the zip command so we use the compress-archive powershell command
+        if: matrix.os == 'windows'
+        run: |
+          cd target/${{ matrix.target }}/release/
+          compress-archive -Path ${{ matrix.binary }} -DestinationPath ${{ env.ZIP_NAME }}
+  
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.os }}-zip
+          path: target/${{ matrix.target }}/release/${{ env.ZIP_NAME }}
+
+  manual:
+    name: Build User Manual
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install mdbook and plugins
+        run: |
+          cargo install mdbook
+          cargo install mdbook-pandoc
+
+      - name: Install Pandoc & LaTeX
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pandoc \
+            texlive-latex-base texlive-latex-extra \
+            texlive-fonts-recommended lmodern
+
+      - name: Build docs
+        run: cd manual && mdbook build
+
+      - name: Upload PDF
+        uses: actions/upload-artifact@v4
+        with:
+          name: pdf-docs
+          path: manual/book/pandoc/pdf/a2ltool_manual.pdf
+
+  release:
+    name: Create Release
+    needs: [build, manual]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name:                # because name is empty, it will download all artifacts
+          merge-multiple: true # merge all artifacts into one directory
+
+      - name: Create Release
+        id: create_release
+        uses: ncipollo/release-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag: ${{ github.ref }}
+          name: Version ${{ github.ref_name }}
+          body: ${{ github.event.head_commit.message }}
+          draft: true
+          prerelease: false
+          artifacts: "*.zip,*.pdf"
+

@@ -1,23 +1,30 @@
 [package]
 name = "a2ltool"
-version = "2.1.0"
+version = "3.2.0"
 authors = ["Daniel Thaler <daniel@dthaler.de>"]
-edition = "2021"
+edition = "2024"
 license = "MIT OR Apache-2.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-a2lfile = "2.1.0"
-object = { version = "~0.36", default-features = false, features = ["read"] }
-gimli = { version = "~0.30", default-features = false, features = ["read"] }
-memmap2 = "~0.9"
-clap = { version = "~4.5", features = ["wrap_help"]}
-cpp_demangle = "0.4.3"
+a2lfile = "3.3.0"
+object = { version = "0.38", default-features = false, features = ["read"] }
+gimli = { version = "0.33", default-features = false, features = ["read"] }
+memmap2 = "0.9"
+clap = { version = "4.5", features = ["wrap_help"]}
+cpp_demangle = "0.5.0"
 regex = "1"
-indexmap = "2.2.0"
-fxhash = "0.2.1"
+indexmap = "2.8.0"
+fnv = "1.0.7"
 argfile = { version ="0.2.0", features=["response"]}
+pdb2 = "0.10"
+memchr = "2.7.5"
+num-traits = "0.2.19"
+glob = "0.3.3"
+
+[dev-dependencies]
+tempfile = "3.19"
 
 [profile.release]
 panic = "abort"
