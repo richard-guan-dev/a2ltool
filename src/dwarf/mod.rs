@@ -125,7 +125,7 @@ impl DebugData {
         Ok(dbg_reader.read_debug_info_entries())
     }
 
-    pub(crate) fn iter(&self, use_new_arrays: bool) -> iter::VariablesIterator {
+    pub(crate) fn iter(&self, use_new_arrays: bool) -> iter::VariablesIterator<'_> {
         iter::VariablesIterator::new(self, use_new_arrays)
     }
 }
@@ -178,7 +178,7 @@ fn get_elf_sections(elffile: &object::read::File) -> HashMap<String, (u64, u64)>
     map
 }
 
-// load the SWARF debug info from the .debug_<xyz> sections
+// load the DWARF debug info from the .debug_<xyz> sections
 fn load_dwarf<'data>(
     elffile: &object::read::File<'data>,
 ) -> Result<gimli::Dwarf<SliceType<'data>>, String> {
