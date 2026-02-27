@@ -614,7 +614,6 @@ fn get_args() -> ArgMatches {
         .long("merge")
         .number_of_values(1)
         .value_name("A2LFILE")
-        .number_of_values(1)
         .value_parser(ValueParser::os_string())
         .action(clap::ArgAction::Append)
     )
@@ -624,7 +623,6 @@ fn get_args() -> ArgMatches {
         .long("merge-project")
         .number_of_values(1)
         .value_name("A2LFILE")
-        .number_of_values(1)
         .value_parser(ValueParser::os_string())
         .action(clap::ArgAction::Append)
     )
@@ -651,7 +649,7 @@ fn get_args() -> ArgMatches {
         .requires("ELFFILE")
     )
     .arg(Arg::new("ENABLE_STRUCTURES")
-        .help("Enable the the use of INSTANCE, TYPEDEF_STRUCTURE & co. for all operations. Requires a2l version 1.7.1")
+        .help("Enable the use of INSTANCE, TYPEDEF_STRUCTURE & co. for all operations. Requires a2l version 1.7.1")
         .short('t')
         .long("enable-structures")
         .number_of_values(0)
@@ -808,7 +806,7 @@ fn get_args() -> ArgMatches {
         .action(clap::ArgAction::Append)
     )
     .arg(Arg::new("TARGET_GROUP")
-        .help("When inserting items, put them into the group named in this option. The group will be created if it doe not exist.")
+        .help("When inserting items, put them into the group named in this option. The group will be created if it does not exist.")
         .long("target-group")
         .number_of_values(1)
         .requires("INSERT_ARGGROUP")
@@ -828,8 +826,9 @@ fn get_args() -> ArgMatches {
     .group(
         ArgGroup::new("INSERT_ARGGROUP")
             .args(["INSERT_CHARACTERISTIC", "INSERT_CHARACTERISTIC_RANGE", "INSERT_CHARACTERISTIC_REGEX",
+                "INSERT_CHARACTERISTIC_SECTION",
                 "INSERT_MEASUREMENT", "INSERT_MEASUREMENT_RANGE", "INSERT_MEASUREMENT_REGEX",
-                "INSERT_MEASUREMENT_SECTION", "INSERT_MEASUREMENT_SECTION", ])
+                "INSERT_MEASUREMENT_SECTION"])
             .multiple(true)
     )
     .next_line_help(false)

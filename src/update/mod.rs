@@ -27,7 +27,7 @@ use measurement::*;
 use record_layout::*;
 use typedef::update_module_typedefs;
 
-pub(crate) struct UpdateSumary {
+pub(crate) struct UpdateSummary {
     pub(crate) measurement_updated: u32,
     pub(crate) measurement_not_updated: u32,
     pub(crate) characteristic_updated: u32,
@@ -74,10 +74,10 @@ pub(crate) fn update_addresses(
     log_msgs: &mut Vec<String>,
     preserve_unknown: bool,
     enable_structures: bool,
-) -> UpdateSumary {
+) -> UpdateSummary {
     let version = A2lVersion::from(&*a2l_file);
 
-    let mut summary = UpdateSumary::new();
+    let mut summary = UpdateSummary::new();
     for module in &mut a2l_file.project.module {
         let reclayout_info = RecordLayoutInfo::build(module);
         let mut info = UpdateInfo {
@@ -99,8 +99,8 @@ pub(crate) fn update_addresses(
 
         // update all AXIS_PTS
         let (updated, not_updated) = update_module_axis_pts(&mut info, &compu_method_index);
-        summary.measurement_updated += updated;
-        summary.measurement_not_updated += not_updated;
+        summary.axis_pts_updated += updated;
+        summary.axis_pts_not_updated += not_updated;
 
         // update all MEASUREMENTs
         let (updated, not_updated) = update_module_measurements(&mut info, &compu_method_index);
@@ -430,7 +430,7 @@ fn cleanup_item_list(item_list: &mut Vec<String>, removed_items: &HashSet<String
     }
 }
 
-impl UpdateSumary {
+impl UpdateSummary {
     fn new() -> Self {
         Self {
             axis_pts_not_updated: 0,

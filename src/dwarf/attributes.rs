@@ -294,11 +294,7 @@ pub(crate) fn get_specification_attribute<'data, 'abbrev, 'unit>(
     let specification_attr = get_attr_value(entry, gimli::constants::DW_AT_specification)?;
     match specification_attr {
         gimli::AttributeValue::UnitRef(unitoffset) => {
-            if let Ok(specification_entry) = unit.entry(abbrev, unitoffset) {
-                Some(specification_entry)
-            } else {
-                None
-            }
+            unit.entry(abbrev, unitoffset).ok()
         }
         gimli::AttributeValue::DebugInfoRef(_) => {
             // presumably, a debugger could also generate a DebugInfo ref instead on a UnitRef
@@ -318,11 +314,7 @@ pub(crate) fn get_abstract_origin_attribute<'data, 'abbrev, 'unit>(
     let origin_attr = get_attr_value(entry, gimli::constants::DW_AT_abstract_origin)?;
     match origin_attr {
         gimli::AttributeValue::UnitRef(unitoffset) => {
-            if let Ok(origin_entry) = unit.entry(abbrev, unitoffset) {
-                Some(origin_entry)
-            } else {
-                None
-            }
+            unit.entry(abbrev, unitoffset).ok()
         }
         _ => None,
     }
